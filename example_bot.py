@@ -237,7 +237,8 @@ class Bot:
                 k, st = w["kind"], w["stats"]
                 size = math.atan2(T["r"], T["d"])
                 if k == "gun":
-                    aims[i] = aim_at(muzzle, lead(muzzle, T["c"], T["vel"], st["speed"]))
+                    p = lead(muzzle, T["c"], T["vel"], st["speed"])
+                    aims[i] = aim_at(muzzle, [T["c"][j] + (p[j] - T["c"][j]) * 0.8 for j in range(3)])  # strafers reverse: 80% of the lead hits most (duel-tested)
                     ok[i] = T["los"] and T["d"] <= st["range"] and w.get("ammo", 1) > 0 and not w.get("reload")
                     tol[i] = size + 0.006
                 elif k == "laser":
@@ -395,7 +396,8 @@ class Bot:
         enemies = [m for m in obs["mechs"] if m["kind"] == "mech"]
         near = min(enemies, key=lambda m: d2(m["pos"], pos), default=None)
         stronger = near is not None and near.get("hp", 0) > 1.5 * me["hp"] and near.get("cubes", 0) >= me["cubes"] + 3
-        fleeing = near is not None and d2(near["pos"], pos) < 150 and (hpf < FLEE_HP or stronger)
+        # Low on HP: run, unless the one in front of us has even less (running would throw away a fight we're winning).
+        fleeing = near is not None and d2(near["pos"], pos) < 150 and ((hpf < FLEE_HP and near.get("hp", 0) >= me["hp"]) or stronger)
         recent_hit = self.threat is not None and t - self.threat[1] < 2.0
         T = self.targets(obs, me, muzzle, hpf, fleeing)
         aim, fire, reload = self.weapons(me, muzzle, tube, T, fleeing, recent_hit, t)
@@ -436,7 +438,7 @@ class Bot:
             move = self.steer(pos, goal, t, force=self.stuck_since is not None and t - self.stuck_since > 1) if gap > arrive else [0.0, 0.0]
             if mode == "edge" and T and T["kind"] == "mech" and T["los"]:  # strafe across their line of fire
                 if t >= self.strafe_until:
-                    self.strafe_sign, self.strafe_until = self.rng.choice((-1, 1)), t + self.rng.uniform(0.6, 1.4)
+                    self.strafe_sign, self.strafe_until = -self.strafe_sign, t + self.rng.uniform(0.35, 0.9)  # reverse before their led shot lands
                 yaw = math.atan2(T["pos"][1] - y, T["pos"][0] - x) + self.strafe_sign * math.pi / 2
                 pull = min(gap / 6, 1.0)
                 to_spot = unit(goal[0] - x, goal[1] - y)
