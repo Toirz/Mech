@@ -21,7 +21,11 @@ PATH_BUDGET = 0.01   # s of A* per decision (the whole decision must fit in 50 m
 MAP_MARGIN = 15.0    # m: goals stay this far inside the map edge (a wall); the first zone is bigger than the map
 MECH_SOUNDS = {"gun", "mortar", "laser", "laser_charge", "lightning", "step", "boost", "reload", "jet"}
 WEAPON_VALUE = {"laser": 1.0, "lightning": 0.7, "gun": 0.5}  # never a mortar: a laser hit on its carrier cooks off (+60%)
+NARROW_VALUE = {"lightning": 1.0, "laser": 0.7, "gun": 0.5}  # small zone, close fights: lightning (45 m) over laser
+NARROW_R = 140.0     # m: once the zone is closing to this radius or less, it counts as narrow
 EARLY_S, EARLY_RANGE = 60.0, 250.0  # the first minute: walk this far for a laser (else a lightning)
+HUNT_RANGE = 150.0   # m: after the first minute, walk this far for the weapon the zone calls for
+PICKUP_MEM = 240.0   # s: weapons on the ground never despawn, so remember them long enough to come back for one
 GUN_OPEN = 100.0     # m: the gun doesn't start a fight with a mech farther than this (it joins one at any range)
 SWEEP, SWEEP_S = 1.0, 6.0  # at the edge, look this far (rad) to either side of inward, one sweep each way per SWEEP_S s
 QUIET_MOVE, QUIET_NEAR = 0.42, 60.0  # under 5 m/s (|move| 0.42 of 11.7) makes no step sound; walk so near enemies
@@ -158,6 +162,7 @@ class Bot:
         self.heard = None                # (bearing, t, dist) of the last mech sound
         self.strafe_sign, self.strafe_until = 1, 0.0
         self.burn = True  # boosting in a fight: on until energy drops to 25, back on at 70
+        self.narrow = False              # the zone is closing to NARROW_R or less: lightning over laser
         self.vhist = {}  # target id -> [(t, its velocity)] over the last 2 s
         self.short_until = 0.0
         self.pickups = {}                # id -> (kind, pos, t seen)
@@ -183,7 +188,7 @@ class Bot:
         seen_c = {c["id"] for c in obs["cubes"]}
         # Close by and not listed: someone took it. Old memories expire.
         self.pickups = {k: v for k, v in self.pickups.items()
-                        if (k in seen_p or d2(v[1], pos) > 25) and t - v[2] < 60}
+                        if (k in seen_p or d2(v[1], pos) > 25) and t - v[2] < PICKUP_MEM}
         self.cubes = {k: v for k, v in self.cubes.items() if (k in seen_c or d2(v[0], pos) > 25) and t - v[1] < 60}
         for e in obs["events"]:
             if e["type"] == "damaged" and e.get("bearing") is not None:
@@ -226,17 +231,18 @@ class Bot:
 
     # ----- weapons -----
     def wants(self, kind, me):
-        """Is a pickup of this kind worth taking, and into which slot (drop) if both are full? Aim: gun + laser."""
-        ws = me["weapons"]
-        if kind not in WEAPON_VALUE or kind == "gun" or any(w and w["kind"] == kind for w in ws):
+        """Is a pickup of this kind worth taking, and into which slot (drop) if both are full?
+        Aim: gun + laser while the zone is wide, gun + lightning once it is narrow."""
+        ws, value = me["weapons"], NARROW_VALUE if self.narrow else WEAPON_VALUE
+        if kind not in value or kind == "gun" or any(w and w["kind"] == kind for w in ws):
             return False, None
         if None in ws:
             return True, None
         swap = [i for i, w in enumerate(ws) if w["kind"] != "gun" and not w.get("charge")]
         if not swap:
             return False, None
-        i = min(swap, key=lambda i: WEAPON_VALUE.get(ws[i]["kind"], 0))
-        return WEAPON_VALUE[kind] > WEAPON_VALUE.get(ws[i]["kind"], 0) + 0.2, i  # a laser replaces a lightning
+        i = min(swap, key=lambda i: value.get(ws[i]["kind"], 0))
+        return value[kind] > value.get(ws[i]["kind"], 0) + 0.2, i  # the zone's weapon replaces the other one
 
     def classify(self, m, pos):
         """1 attacking us (hit us in 3 s, or charging a laser at us), 2 fighting someone else or under 40% HP,
@@ -559,12 +565,16 @@ class Bot:
             return spots[n] if n < len(spots) else len(plan) + (UPGRADE_REST.index(u) if u in UPGRADE_REST else 99)
         return min(range(len(ids)), key=lambda i: rank(ids[i]))
 
-    def early_laser(self, me, pos, enemies):
-        """In the first minute: the nearest laser seen within EARLY_RANGE (else a lightning) we want and can reach first."""
-        for kind in ("laser", "lightning"):
+    def hunt_weapon(self, me, pos, enemies, c, r):
+        """The nearest weapon the zone calls for (laser while wide, lightning once narrow) that we want, can reach first,
+        and that lies inside the coming circle. In the first minute: within EARLY_RANGE, a lightning if no laser."""
+        early = self.t < EARLY_S
+        kinds = ("lightning",) if self.narrow else ("laser", "lightning") if early else ("laser",)
+        rng = EARLY_RANGE if early else HUNT_RANGE
+        for kind in kinds:
             best = min(((d2(p, pos), p) for pid, (k, p, _) in self.pickups.items()
                         if k == kind and self.bad_pickups.get(pid, -1) < self.t and self.wants(k, me)[0]
-                        and d2(p, pos) < EARLY_RANGE and abs(p[2] - pos[2]) < 4  # not on a roof
+                        and d2(p, pos) < rng and d2(p, c) < r - 6 and abs(p[2] - pos[2]) < 4  # not on a roof
                         and not any(d2(m["pos"], p) < d2(p, pos) for m in enemies)), default=None)  # nobody closer to it
             if best:
                 return best[1]
@@ -678,6 +688,7 @@ class Bot:
         pos = me["pos"]
         x, y, z = pos
         t = self.t = obs["t"]
+        self.narrow = obs["zone"]["next_radius"] <= NARROW_R
         self.remember(obs, t, pos)
         spc = self.cfg["cubes"].get("size_per_cube", 0.05)
         for m in obs["mechs"]:  # feed the motion predictor (and score it in hindsight)
@@ -761,9 +772,10 @@ class Bot:
                     break
             loot = None if (near and d2(near["pos"], pos) < 70) or hpf < 0.35 else self.loot_goal(me, pos, c, r)
             shot_at = self.threat is not None and t - self.threat[1] < 3
-            early = self.early_laser(me, pos, enemies) if t < EARLY_S and not shot_at else None
-            if early:
-                goal, mode, arrive = early, "laser", 1.0
+            calm = t < EARLY_S or not (near and d2(near["pos"], pos) < 70)  # after the first minute, not past a mech
+            hunt = self.hunt_weapon(me, pos, enemies, c, r) if calm and not shot_at else None
+            if hunt:
+                goal, mode, arrive = hunt, "lightning" if self.narrow else "laser", 1.0
             elif drop:
                 goal, mode, arrive = drop["pos"], "drop", max(drop["radius"] - 3, 1.0)
             elif loot:
