@@ -124,6 +124,8 @@ class Bot:
         self.threat = None               # (bearing, t) of the last hit we took
         self.heard = None                # (bearing, t, dist) of the last mech sound
         self.strafe_sign, self.strafe_until = 1, 0.0
+        self.burn = True  # boosting in a fight: on until energy drops to 25, back on at 70
+        self.vhist = {}  # target id -> [(t, its velocity)] over the last 2 s
         self.short_until = 0.0
         self.seen_weapons = {}           # mech id -> weapons it was seen holding
         self.pickups = {}                # id -> (kind, pos, t seen)
@@ -226,11 +228,17 @@ class Bot:
                     return x
         return None
 
-    def weapons(self, me, muzzle, tube, T, fleeing, recent_hit, t):
+    def weapons(self, me, muzzle, tube, T, fleeing, t):
         """(aim or None, fire[2], reload)."""
         ws, now = me["weapons"], me["aim"]
         aims, ok, tol = [None, None], [False, False], [0.0, 0.0]
         if T:
+            h = self.vhist.setdefault(T["id"], [])
+            h[:] = [e for e in h if t - e[0] < 2.0] + [(t, T["vel"])]
+
+            def vavg(s):  # its mean velocity over the last s seconds
+                hs = [v for ts, v in h if t - ts <= s + 1e-6]
+                return [sum(v[j] for v in hs) / len(hs) for j in range(3)]
             for i, w in enumerate(ws):
                 if not w:
                     continue
@@ -250,7 +258,8 @@ class Bot:
                     ok[i] = T["los"] and T["d"] <= st["range"] * 0.95 and me["energy"] >= st["energy"] + 5
                     tol[i] = math.radians(st["cone_deg"]) / 2 * 0.7
                 elif k == "mortar":
-                    sol = mortar_aim(tube, [T["pos"][0], T["pos"][1], T["pos"][2] + 0.5], T["vel"], st["speed"],
+                    # lead by its mean velocity over 2 s: a strafer's shell lands on the middle of its dance (aim-range tested)
+                    sol = mortar_aim(tube, [T["pos"][0], T["pos"][1], T["pos"][2] + 0.5], vavg(2.0), st["speed"],
                                      st["gravity"], high=not T["los"], max_pitch=self.mech["max_pitch"])
                     if sol:
                         aims[i] = sol[0]
@@ -294,8 +303,6 @@ class Bot:
                 fire[i] = ok[i] and w["cooldown"] <= 0.1 and abs(ang_diff(now[0], aims[i][0])) < tol[i]
             else:
                 fire[i] = ok[i] and w["cooldown"] <= 0.1 and err < tol[i]
-            if fleeing and not recent_hit and k != "laser":
-                fire[i] = False  # shooting resets HP regen; only shoot back if they're on us
         gun = next((w for w in ws if w and w["kind"] == "gun"), None)
         calm = T is None or T["kind"] != "mech"
         reload = bool(gun) and not gun.get("reload") and (gun.get("ammo", 1) == 0 or (calm and gun.get("ammo", 0) < gun["stats"]["mag"] / 2))
@@ -398,9 +405,8 @@ class Bot:
         stronger = near is not None and near.get("hp", 0) > 1.5 * me["hp"] and near.get("cubes", 0) >= me["cubes"] + 3
         # Low on HP: run, unless the one in front of us has even less (running would throw away a fight we're winning).
         fleeing = near is not None and d2(near["pos"], pos) < 150 and ((hpf < FLEE_HP and near.get("hp", 0) >= me["hp"]) or stronger)
-        recent_hit = self.threat is not None and t - self.threat[1] < 2.0
         T = self.targets(obs, me, muzzle, hpf, fleeing)
-        aim, fire, reload = self.weapons(me, muzzle, tube, T, fleeing, recent_hit, t)
+        aim, fire, reload = self.weapons(me, muzzle, tube, T, fleeing, t)  # we shoot while running too: holding fire lost duels
 
         # Movement goal.
         c, r = zone_at(obs["zone"], t + LOOKAHEAD_S)
@@ -445,6 +451,8 @@ class Bot:
                 move = unit(math.cos(yaw) + to_spot[0] * pull, math.sin(yaw) + to_spot[1] * pull)
 
         # Stuck: commanded to move but not getting anywhere -> jump and jet; if that fails too, sidestep.
+        # Not while fighting inside the zone (hopping about loses the fight); outside it the zone kills faster than they do.
+        fighting = bool(T and T["kind"] == "mech" and T["los"] and me["in_zone"])
         wants_move = math.hypot(*move) > 0.5
         self.hist = [h for h in self.hist if t - h[0] < 1.2] + [(t, x, y, wants_move)]
         h0 = self.hist[0]
@@ -454,12 +462,16 @@ class Bot:
         if t < self.unstick_until:
             move = self.unstick_dir
         elif stuck:
-            jump = me["grounded"]
+            jump = me["grounded"] and not fighting
             if t - self.stuck_since > 2.5:
                 a = math.atan2(move[1], move[0]) + self.rng.choice((-1, 1)) * math.pi / 2
                 self.unstick_dir, self.unstick_until = [math.cos(a), math.sin(a)], t + 1.0
                 self.stuck_since, self.path = None, []
-        boost = mode in ("dodge laser", "dodge shell", "zone", "flee") or stuck or (gap > 40 and me["energy"] > 60 and not T)
+        boost = mode in ("dodge laser", "dodge shell", "zone", "flee") or (stuck and not fighting) or (
+            gap > 40 and me["energy"] > 60 and not T)
+        if fighting:  # boost through the whole fight, walking just long enough to recharge (duel-tested; jets lost)
+            self.burn = me["energy"] > 70 if not self.burn else me["energy"] > 25
+            boost = boost or (self.burn and me["grounded"])
 
         # Where to look when there's nothing to shoot.
         if aim is None:
