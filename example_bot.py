@@ -26,6 +26,9 @@ LATENCY = 0.03       # s from an observation to the shot leaving (the action app
 GUN_TOL = 1.0        # m: the gun fires only when its aim is this close to the lead point, at the target
 GUN_MIN_P = 0.15     # the gun holds fire below this estimated hit chance
 LASER_MARGIN = 0.8   # m: the beam must point this far inside the target's edge when we let go
+GHOST_S = 8.0       # s we keep guessing where an unseen mech is
+GHOST_DIST = {"near": 40.0, "mid": 110.0, "far": 220.0}  # m: a guess inside each sound distance band
+GHOST_W = {"laser": 1.5, "laser_charge": 1.5, "gun": 1.0, "lightning": 1.0, "mortar": 1.0}  # steps, boosts, jets: 0.5
 DEBUG = bool(__import__("os").environ.get("BOT_DEBUG"))
 # Upgrade order, one entry per stack; with lightning in hand its two upgrades come right after laser_charge.
 UPGRADE_PLAN = ["plating", "laser_damage", "nanites", "plating", "laser_damage", "laser_charge", "plating", "armor",
@@ -141,6 +144,8 @@ class Bot:
         self.cubes = {}                  # id -> (pos, t seen)
         self.bad_pickups = {}            # id -> t until we stop trying it
         self.hit_by, self.hit_on = {}, {}  # id -> last time it damaged us / we damaged it
+        self.foes = {}                   # mech id -> (pos, t) last listed in obs.mechs
+        self.ghosts = []                 # [x, y, t, w]: where an unseen mech probably is (sound, hit from out of view, left view)
         self.dbg = {}
         self.pred = Predictor(self.mech.get("gravity", 22), self.world.ground_at if self.world else None)
 
@@ -159,8 +164,8 @@ class Bot:
         for e in obs["events"]:
             if e["type"] == "damaged" and e.get("bearing") is not None:
                 self.threat = (e["bearing"], t)
-                if e.get("rear"):
-                    self.turn_to = (e["bearing"], t)
+                if e.get("rear") or (e.get("by") is not None and e["by"] not in {m["id"] for m in obs["mechs"]}):
+                    self.turn_to = (e["bearing"], t)  # behind us, or out of view (60-90 deg off our aim)
                 if e.get("by") is not None:
                     self.hit_by[e["by"]] = t
             elif e["type"] == "hit":
@@ -177,6 +182,53 @@ class Bot:
         if sounds:
             s = min(sounds, key=lambda s: (["near", "mid", "far"].index(s["dist"]), s["age"]))
             self.heard = (s["bearing"], t - s["age"], s["dist"])
+        self.track_ghosts(obs, t, pos)
+
+    def track_ghosts(self, obs, t, pos):
+        """Guess where the mechs we can't see are: from sounds, from hits by someone out of view, and from where a
+        tracked mech dropped out of the list. A guess we can now see and find empty is dropped."""
+        seen = {m["id"]: m["pos"] for m in obs["mechs"] if m["kind"] == "mech"}
+        new = [(p[0], p[1], 1.0) for k, (p, _) in self.foes.items() if k not in seen]  # left view (and the server's 5 s memory)
+        self.foes = {**{k: v for k, v in self.foes.items() if k in seen}, **{k: (p, t) for k, p in seen.items()}}
+
+        def at(bearing, d):
+            return pos[0] + math.cos(bearing) * d, pos[1] + math.sin(bearing) * d
+        for s in obs["sounds"]:
+            if s["kind"] not in MECH_SOUNDS:
+                continue
+            d = min(GHOST_DIST[s["dist"]], self.cfg["sound"]["range"].get(s["kind"], 400) * 0.8)
+            if any(abs(ang_diff(math.atan2(p[1] - pos[1], p[0] - pos[0]), s["bearing"])) < 0.3 for p in seen.values()):
+                continue  # most likely a mech we already see
+            new.append((*at(s["bearing"], d), GHOST_W.get(s["kind"], 0.5)))
+        for e in obs["events"]:
+            if e["type"] == "damaged" and e.get("by") is not None and e["by"] not in seen and e.get("bearing") is not None:
+                d = 60.0 if e["weapon"] == "lightning" else 110.0  # the kills came from 45-160 m
+                new.append((*at(e["bearing"], d), 2.0))
+        for gx, gy, w in new:
+            g = next((g for g in self.ghosts if math.hypot(g[0] - gx, g[1] - gy) < 35), None)
+            if g:
+                g[:] = [gx, gy, t, max(g[3], w)]
+            else:
+                self.ghosts.append([gx, gy, t, w])
+        vis = self.cfg["vision"]
+        eye = [pos[0], pos[1], pos[2] + self.mech["eye_height"]]
+        yaw = obs["self"]["aim"][0]
+        keep = []
+        for g in self.ghosts:
+            if t - g[2] > GHOST_S:
+                continue
+            d = d2(g, pos)
+            in_view = d < vis["near_range"] or (d < vis["range"] and abs(ang_diff(math.atan2(g[1] - pos[1], g[0] - pos[0]), yaw))
+                                                < math.radians(vis["fov_deg"]) / 2 - 0.1)
+            gz = self.world.ground_at(g[0], g[1], pos[2]) if self.world else pos[2]
+            if (t - g[2] > 0.5 and in_view and not any(d2(p, g) < 35 for p in seen.values())
+                    and self.los(eye, [g[0], g[1], gz + 4.5])):
+                continue  # we look right at it and nobody is there
+            keep.append(g)
+        self.ghosts = sorted(keep, key=lambda g: -self.ghost_danger(g, pos))[:8]
+
+    def ghost_danger(self, g, pos):
+        return g[3] * (1 - (self.t - g[2]) / GHOST_S) / max(d2(g, pos) / 100, 0.5)
 
     def los(self, a, b):
         return self.world.clear(a, b) if self.world else True
@@ -232,8 +284,8 @@ class Bot:
             return npc
         if mechs:
             return min(mechs, key=score)
-        if hpf < 0.6:
-            return None
+        if hpf < 0.6 or any(self.t - g[2] < 3 and d2(g, me["pos"]) < 160 for g in self.ghosts):
+            return None  # a fresh guess nearby: look that way instead of farming (the gun's noise carries 320 m)
         for x in sorted(others, key=lambda x: (x["kind"] != "npc", x["d"])):
             if x["d"] < (150 if x["kind"] == "npc" else 120) and (x["kind"] == "npc" or me["cubes"] < CUBE_KEEP or None in me["weapons"]):
                 x["los"] = self.los(muzzle, x["c"])
@@ -539,7 +591,8 @@ class Bot:
                 dd = d2(dr["pos"], pos)
                 if (dr["holder"] in (None, me["id"]) and dd < 250 and d2(dr["pos"], c) < r - 3
                         and dr["lands_in"] <= dd / st.get("walk_speed", 11.7) + 10
-                        and not any(d2(m["pos"], dr["pos"]) < 60 for m in enemies)):
+                        and not any(d2(m["pos"], dr["pos"]) < 60 for m in enemies)
+                        and not any(d2(g, dr["pos"]) < 60 for g in self.ghosts)):
                     drop = dr
                     break
             loot = None if (near and d2(near["pos"], pos) < 70) or hpf < 0.35 else self.loot_goal(me, pos, c, r)
@@ -593,6 +646,9 @@ class Bot:
                 aim = [me["aim"][0] + 1.0, 0.0]
             elif self.threat and t - self.threat[1] < 3:  # turn to face whoever hit us
                 aim = [self.threat[0], 0.0]
+            elif self.ghosts and t - self.ghosts[0][2] < 5:  # the likeliest unseen mech: look until it shows or the spot is empty
+                g = self.ghosts[0]
+                aim = [math.atan2(g[1] - y, g[0] - x), 0.0]
             elif self.heard and t - self.heard[1] < 2:
                 aim = [self.heard[0], 0.0]
             elif gap > 30 and wants_move:
