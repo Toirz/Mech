@@ -649,7 +649,9 @@ class Bot:
             early = self.early_laser(me, pos, enemies) if t < EARLY_S and not shot_at else None
             engaged = bool(T and T["kind"] == "mech" and T["los"]
                            and (T["d"] < FIGHT_RANGE or t - self.hit_by.get(T["id"], -1e9) < 3))
-            hide = self.cover_spot(pos, c, r, enemies, t) if self.hiding and not drop else None
+            # shot by a mech we can see: stand and trade (running shows it our back, x1.5); hide once it lets up
+            under_fire = bool(T and T["kind"] == "mech" and T["los"] and t - self.hit_by.get(T["id"], -1e9) < 3)
+            hide = self.cover_spot(pos, c, r, enemies, t) if self.hiding and not drop and not under_fire else None
             calm = (not self.hiding and hpf >= 0.6 and not shot_at and not engaged
                     and not any(d2(m["pos"], pos) < ROOF_CALM for m in enemies))
             if self.climb and (t - self.climb["t0"] > ROOF_TIMEOUT or (me["grounded"] and not calm and not self.on_roof(pos))):
