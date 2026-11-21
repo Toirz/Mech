@@ -26,6 +26,10 @@ LATENCY = 0.03       # s from an observation to the shot leaving (the action app
 GUN_TOL = 1.0        # m: the gun fires only when its aim is this close to the lead point, at the target
 GUN_MIN_P = 0.15     # the gun holds fire below this estimated hit chance
 LASER_MARGIN = 0.8   # m: the beam must point this far inside the target's edge when we let go
+DROP_HP = 0.7        # go for a supply drop only with this much HP,
+DROP_CALM_S = 5.0    # not shot at for this long,
+DROP_CLEAR, DROP_CLEAR_S = 150.0, 10.0  # and no mech seen this close to it in this long (it's where the whole map heads)
+QUIET_MOVE = 0.42    # |move| under 5 m/s (0.42 of 11.7): no step sound
 DEBUG = bool(__import__("os").environ.get("BOT_DEBUG"))
 # Upgrade order, one entry per stack; with lightning in hand its two upgrades come right after laser_charge.
 UPGRADE_PLAN = ["plating", "laser_damage", "nanites", "plating", "laser_damage", "laser_charge", "plating", "armor",
@@ -141,6 +145,7 @@ class Bot:
         self.cubes = {}                  # id -> (pos, t seen)
         self.bad_pickups = {}            # id -> t until we stop trying it
         self.hit_by, self.hit_on = {}, {}  # id -> last time it damaged us / we damaged it
+        self.foes = {}                   # mech id -> (pos, t) last seen
         self.dbg = {}
         self.pred = Predictor(self.mech.get("gravity", 22), self.world.ground_at if self.world else None)
 
@@ -174,6 +179,10 @@ class Bot:
                 self.pickups.pop(e["id"], None)
             elif e["type"] == "effect" and e["effect"] == "short":
                 self.short_until = t + self.cfg["weapons"]["lightning"].get("short_s", 2)
+        for m in obs["mechs"]:
+            if m["kind"] == "mech":
+                self.foes[m["id"]] = (m["pos"], t)
+        self.foes = {k: v for k, v in self.foes.items() if t - v[1] < DROP_CLEAR_S}
         sounds = [s for s in obs["sounds"] if s["kind"] in MECH_SOUNDS]
         if sounds:
             s = min(sounds, key=lambda s: (["near", "mid", "far"].index(s["dist"]), s["age"]))
@@ -536,11 +545,12 @@ class Bot:
             mode = "zone"
         else:
             drop = None
-            for dr in obs.get("drops", []):
+            calm = hpf >= DROP_HP and (self.threat is None or t - self.threat[1] > DROP_CALM_S)
+            for dr in obs.get("drops", []) if calm else ():
                 dd = d2(dr["pos"], pos)
                 if (dr["holder"] in (None, me["id"]) and dd < 250 and d2(dr["pos"], c) < r - 3
                         and dr["lands_in"] <= dd / st.get("walk_speed", 11.7) + 10
-                        and not any(d2(m["pos"], dr["pos"]) < 60 for m in enemies)):
+                        and not any(d2(p, dr["pos"]) < DROP_CLEAR for p, _ in self.foes.values())):
                     drop = dr
                     break
             loot = None if (near and d2(near["pos"], pos) < 70) or hpf < 0.35 else self.loot_goal(me, pos, c, r)
@@ -563,6 +573,9 @@ class Bot:
                 pull = min(gap / 6, 1.0)
                 to_spot = unit(goal[0] - x, goal[1] - y)
                 move = unit(math.cos(yaw) + to_spot[0] * pull, math.sin(yaw) + to_spot[1] * pull)
+            elif mode == "drop" and gap <= arrive:  # in the ring: circle it without a step sound; standing still is the easiest shot
+                tan = unit(goal[1] - y, x - goal[0])
+                move = [v * QUIET_MOVE for v in (tan if tan != [0.0, 0.0] else [1.0, 0.0])]
 
         # Stuck: commanded to move but not getting anywhere -> jump and jet; if that fails too, sidestep.
         # Not while fighting inside the zone (hopping about loses the fight); outside it the zone kills faster than they do.
