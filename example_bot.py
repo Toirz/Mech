@@ -18,6 +18,10 @@ ARRIVED = 3.0        # m from a goal: stand still (silent, and HP regens)
 LOOT_RANGE = 200.0   # m: farthest we walk for a weapon or cube (roaming: we go looking)
 CUBE_KEEP = 15       # past this, cubes only make us bigger (stats cap at 10; 15 = one more upgrade)
 MORTAR_MIN = 20.0    # m: closer than this our own splash and knockback hurt us
+TRAVEL_LOOK = 260.0  # m: how far along the straight line we look for something to jet over (all the way, in practice)
+TRAVEL_SPAN = 8      # m past its first edge that count as the same obstacle (its tallest part sets the climb)
+TRAVEL_MODES = ("zone", "drop", "hide", "laser", "loot", "roam", "edge")  # bird's flight with the jet
+HURRY_MODES = ("laser", "drop", "loot")  # boost there, sparing only the energy the next jet needs
 SLIDE_AHEAD = 1.2    # m: look this far along the move for walls (one decision at walk speed)
 PATH_BUDGET = 0.01   # s of A* per decision (the whole decision must fit in 50 ms)
 MAP_MARGIN = 15.0    # m: goals stay this far inside the map edge (a wall); the first zone is bigger than the map
@@ -425,12 +429,12 @@ class Bot:
             return spots[n] if n < len(spots) else len(plan) + (UPGRADE_REST.index(u) if u in UPGRADE_REST else 99)
         return min(range(len(ids)), key=lambda i: rank(ids[i]))
 
-    def early_laser(self, me, pos, enemies):
+    def early_laser(self, me, pos, enemies, air_ok=False):
         """In the first minute: the nearest laser seen within EARLY_RANGE (else a lightning) we want and can reach first."""
         for kind in ("laser", "lightning"):
             best = min(((d2(p, pos), p) for pid, (k, p, _) in self.pickups.items()
                         if k == kind and self.bad_pickups.get(pid, -1) < self.t and self.wants(k, me)[0]
-                        and d2(p, pos) < EARLY_RANGE and abs(p[2] - pos[2]) < 4  # not on a roof
+                        and d2(p, pos) < EARLY_RANGE and (abs(p[2] - pos[2]) < 4 or (air_ok and p[2] - pos[2] <= ROOF_MAX))
                         and not any(d2(m["pos"], p) < d2(p, pos) for m in enemies)), default=None)  # nobody closer to it
             if best:
                 return best[1]
@@ -555,6 +559,47 @@ class Bot:
                     return [math.cos(a), math.sin(a)]
         return d
 
+    def travel(self, me, pos, goal):
+        """Bird's flight to goal: (move, jet, reserve). Straight at it; when something stands in the way, jump and hold
+        the jet early enough to clear it and let go once over. reserve = energy the next obstacle needs (boost spares it).
+        None when we can't afford the next obstacle in time: then walk round it on the A* path."""
+        w, ms = self.world, self.mech
+        x, y, z = pos
+        dx, dy = goal[0] - x, goal[1] - y
+        dist = math.hypot(dx, dy)
+        if dist < 0.5:
+            return [0.0, 0.0], False, 0.0
+        ux, uy = dx / dist, dy / dist
+        step = ms.get("step_up", 1.2) - 0.3  # a little margin under the walkable step
+        zc, s0, need = z, None, None
+        for k in range(1, int(min(dist, TRAVEL_LOOK)) + 1):
+            S = w.top_under(x + ux * k, y + uy * k)
+            if s0 is None:
+                if S > zc + step:
+                    s0, need = k, S
+                else:
+                    zc = S  # walk up/down with the ground, or drop off an edge
+            elif k <= s0 + TRAVEL_SPAN:
+                need = max(need, S)  # the whole obstacle, not just its first step
+            else:
+                break
+        if s0 is None:
+            return [ux, uy], False, 0.0
+        rate = ms.get("max_rise_speed", 10) - ms.get("gravity", 22) * 0.05  # m/s up with the jet held
+        rise = need + 0.5 - z
+        reserve = ms.get("jet_drain", 15) * (rise / rate + 0.3)
+        if rise > ROOF_MAX + 10:  # a tower: out of reach
+            return None
+        vh = max(math.hypot(me["vel"][0], me["vel"][1]), ms.get("walk_speed", 11.7))
+        trigger = vh * (rise / rate + 0.2) + 1.0
+        if s0 > trigger:  # not yet: keep going (falling, if in the air) ...
+            regen = ms.get("energy_regen", 18) * max((s0 - trigger) / vh - ms.get("energy_regen_delay", 0.6), 0.0)
+            ok = not me["grounded"] or me["energy"] + regen >= reserve  # ... unless the energy can't be there in time
+            return ([ux, uy], False, reserve) if ok else None
+        if me["grounded"] and me["energy"] < reserve:
+            return [0.0, 0.0], False, reserve  # at its foot without the energy: stand still, it refills fastest
+        return [ux, uy], True, reserve
+
     def loot_items(self, me):
         """Remembered loot we want: weapon pickups we'd take, and cubes while we still gain from them."""
         out = [p for pid, (kind, p, _) in self.pickups.items() if self.bad_pickups.get(pid, -1) < self.t and self.wants(kind, me)[0]]
@@ -568,9 +613,10 @@ class Bot:
         i = w._idx(p[0], p[1])
         return i >= 0 and p[2] - w.surf[i] > ROOF_Z
 
-    def loot_goal(self, me, pos, c, r):
-        """The nearest wanted loot on the ground (roof loot is roof_target's)."""
-        return min((p for p in self.loot_items(me) if d2(p, c) < r - 6 and d2(p, pos) < LOOT_RANGE and not self.on_roof(p)),
+    def loot_goal(self, me, pos, c, r, air_ok=False):
+        """The nearest wanted loot; up on a roof (within a jet's reach) only when air_ok (no mech near)."""
+        return min((p for p in self.loot_items(me) if d2(p, c) < r - 6 and d2(p, pos) < LOOT_RANGE
+                    and (not self.on_roof(p) or (air_ok and p[2] - pos[2] <= ROOF_MAX))),
                    key=lambda p: d2(p, pos), default=None)
 
     def roof_target(self, me, pos, c, r):
@@ -660,9 +706,10 @@ class Bot:
                         and not any(d2(m["pos"], dr["pos"]) < 60 for m in enemies)):
                     drop = dr
                     break
-            loot = None if (near and d2(near["pos"], pos) < 70) or hpf < 0.35 else self.loot_goal(me, pos, c, r)
+            air_ok = not any(d2(m["pos"], pos) < ROOF_CALM for m in enemies)  # up in the air we can't dodge
+            loot = None if (near and d2(near["pos"], pos) < 70) or hpf < 0.35 else self.loot_goal(me, pos, c, r, air_ok)
             shot_at = self.threat is not None and t - self.threat[1] < 3
-            early = self.early_laser(me, pos, enemies) if t < EARLY_S and not shot_at else None
+            early = self.early_laser(me, pos, enemies, air_ok) if t < EARLY_S and not shot_at else None
             engaged = bool(T and T["kind"] == "mech" and T["los"]
                            and (T["d"] < FIGHT_RANGE or t - self.hit_by.get(T["id"], -1e9) < 3))
             # shot by a mech we can see: stand and trade (running shows it our back, x1.5); hide once it lets up
@@ -706,6 +753,12 @@ class Bot:
                 climbing = gap > 3 or z < top - 1      # ...until over it, then let go and drop onto it
                 if gap < 1.5 and z > top - 1:
                     self.climb = None                  # there: the take / cube pickup happens on its own
+        reserve = None
+        if (move is None and self.world and mode in TRAVEL_MODES and gap > arrive
+                and not (T and T["kind"] == "mech" and T["los"] and mode == "edge")):  # edge strafing is below
+            tr = self.travel(me, pos, goal)
+            if tr:
+                move, climbing, reserve = tr
         if move is None and mode != "roof" and self.on_roof(pos) and gap > arrive:
             down = self.launch_spot(pos)  # A* sees roofs as walls: walk off the nearest edge first
             if down:
@@ -740,6 +793,11 @@ class Bot:
                 self.stuck_since, self.path = None, []
         boost = climbing or mode in ("dodge shell", "zone") or (stuck and not fighting) or (
             gap > 40 and me["energy"] > 60 and not T and mode != "roof")  # save the energy for the jet
+        if reserve is not None and not climbing and not stuck:
+            # flying straight: in the air boost is the jet, so only on the ground, and never into the next climb's energy
+            spare = me["energy"] > reserve + 10
+            boost = me["grounded"] and spare and (mode == "zone" or (mode in HURRY_MODES and gap > 6)
+                                                   or (gap > 40 and me["energy"] > 60 and not T))
         if fighting:  # boost through the whole fight, walking just long enough to recharge (duel-tested; jets lost)
             self.burn = me["energy"] > 70 if not self.burn else me["energy"] > 25
             boost = boost or (self.burn and me["grounded"])

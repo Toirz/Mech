@@ -64,6 +64,22 @@ if os.path.isdir(arena):
     assert rb.on_roof(item) and not rb.on_roof([item[0], item[1], w.ground[i]])
     ls = rb.launch_spot(item)
     assert ls and w.free(*ls) and math.dist(ls, item[:2]) < 32, ls
+    # Bird's flight: from that launch spot toward the roof item the building is in the way and needs jet energy;
+    # standing at its foot with no energy we wait; across open ground nothing needs it.
+    rb.mech = {}
+    me = {"vel": [0, 0, 0], "grounded": True, "energy": 100}
+    start = [ls[0], ls[1], w.ground_at(*ls)]
+    mv, jet, reserve = rb.travel(me, start, item)
+    assert reserve > 0 and abs(math.hypot(*mv) - 1) < 1e-9, (mv, reserve)
+    foot = next(p for p in ([start[0] + (item[0] - start[0]) * k / 40, start[1] + (item[1] - start[1]) * k / 40] for k in range(40))
+                if w.top_under(*p) > start[2] + 3)  # first spot where the body touches the building
+    back = [foot[0] - (item[0] - start[0]) / math.dist(start[:2], item[:2]) * 1.5, foot[1] - (item[1] - start[1]) / math.dist(start[:2], item[:2]) * 1.5]
+    assert rb.travel(dict(me, energy=0), [back[0], back[1], start[2]], item)[:2] == ([0.0, 0.0], False)
+    assert rb.travel(dict(me, energy=100), [back[0], back[1], start[2]], item)[1] is True
+    def flat(a, b):  # nothing along a -> b stands more than half a metre above a's ground
+        return all(w.top_under(a[0] + (b[0] - a[0]) * k / 30, a[1] + (b[1] - a[1]) * k / 30) < w.ground_at(*a) + 0.5 for k in range(31))
+    open_a, near_b = next((q, [q[0] + 15, q[1]]) for q in free if flat(q, [q[0] + 15, q[1]]))
+    assert rb.travel(me, [open_a[0], open_a[1], w.ground_at(*open_a)], near_b)[1:] == (False, 0.0)
 # Roaming heads for cells we haven't been to, inside the safe circle; hiding without a map stays put.
 b = Bot.__new__(Bot)
 b.rng, b.world, b.visited, b.roam, b.roam_t = random.Random(2), None, {}, None, -1e9

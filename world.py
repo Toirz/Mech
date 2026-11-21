@@ -86,6 +86,13 @@ class World:
                             elif pt > g + step:
                                 wall[idx] = max(wall[idx], 2 if pt > g + CLIMB else 1)
 
+        # What a body standing here stands on or runs into: the walkable surface, or the roof of a solid that
+        # reaches down into a body's height of the ground (an overpass high above doesn't count).
+        top = self.top = array.array("f", surf)
+        for idx in range(nx * ny):
+            if lo[idx] < ground[idx] + height and hi[idx] > top[idx]:
+                top[idx] = hi[idx]
+
         # Shots: a finer solid grid (thin walls and building corners fall between the 2 m cell centers).
         fnx, fny = self.fnx, self.fny = int((tnx - 1) * tstep // FINE), int((tny - 1) * tstep // FINE)
         flo = self.flo = array.array("f", [1e9]) * (fnx * fny)
@@ -186,6 +193,17 @@ class World:
     def nav_center(self, c):
         s = CELL * NAV
         return [self.x0 + (c % self.mnx + 0.5) * s, self.y0 + (c // self.mnx + 0.5) * s]
+
+    def top_under(self, x, y):
+        """Highest surface under a body centred here (its centre and 8 rim points); off the map = infinitely high."""
+        r, top, best = self.body[0], self.top, -1e9
+        for dx, dy in RIM:
+            idx = self._idx(x + dx * r, y + dy * r)
+            if idx < 0:
+                return 1e9
+            if top[idx] > best:
+                best = top[idx]
+        return best
 
     def body_free(self, x, y, z):
         """Could a body with feet at z stand here: no ground more than a step up, no solid in it, not off the map
