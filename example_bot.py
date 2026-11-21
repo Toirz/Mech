@@ -159,10 +159,13 @@ class Bot:
         seen_p = {p["id"] for p in obs["pickups"]}
         seen_c = {c["id"] for c in obs["cubes"]}
         seen_m = {m["id"] for m in obs["mechs"]}
-        # Close by and not listed: someone took it. Old memories expire.
-        self.pickups = {k: v for k, v in self.pickups.items()
-                        if (k in seen_p or d2(v[1], pos) > 25) and t - v[2] < 60}
-        self.cubes = {k: v for k, v in self.cubes.items() if (k in seen_c or d2(v[0], pos) > 25) and t - v[1] < 60}
+        # Close by, in sight and not listed: someone took it (one behind a wall or on a roof just isn't seen). Old memories expire.
+        eye = [pos[0], pos[1], pos[2] + self.mech["eye_height"]]
+
+        def gone(p):
+            return d2(p, pos) < 25 and self.los(eye, [p[0], p[1], p[2] + 0.5])
+        self.pickups = {k: v for k, v in self.pickups.items() if (k in seen_p or not gone(v[1])) and t - v[2] < 60}
+        self.cubes = {k: v for k, v in self.cubes.items() if (k in seen_c or not gone(v[0])) and t - v[1] < 60}
         for e in obs["events"]:
             if e["type"] == "damaged" and e.get("bearing") is not None:
                 self.threat = (e["bearing"], t)
@@ -191,6 +194,10 @@ class Bot:
 
     def los(self, a, b):
         return self.world.clear(a, b) if self.world else True
+
+    def on_roof(self, p):
+        """Is this point more than 3 m above the ground under it (a roof: no walking up to it)?"""
+        return bool(self.world) and p[2] - self.world.ground_at(p[0], p[1], p[2]) > 3
 
     # ----- weapons -----
     def wants(self, kind, me):
@@ -221,6 +228,8 @@ class Bot:
                 others.append(dict(id=m["id"], kind="npc", pos=m["pos"], c=c, vel=m["vel"], r=n["radius"], m=m))
         cr = self.cfg["crates"]
         for k in obs["crates"]:
+            if self.on_roof(k["pos"]):
+                continue  # its cube would land where we can't walk
             c = [k["pos"][0], k["pos"][1], k["pos"][2] + cr["height"] / 2]
             others.append(dict(id=k["id"], kind="crate", pos=k["pos"], c=c, vel=[0, 0, 0], r=cr["radius"], m=k))
         for x in mechs + others:
@@ -481,11 +490,12 @@ class Bot:
     def loot_goal(self, me, pos, c, r):
         best, bd = None, LOOT_RANGE
         for pid, (kind, p, _) in self.pickups.items():
-            if self.bad_pickups.get(pid, -1) < self.t and self.wants(kind, me)[0] and d2(p, c) < r - 6 and d2(p, pos) < bd:
+            if (self.bad_pickups.get(pid, -1) < self.t and self.wants(kind, me)[0] and d2(p, c) < r - 6 and d2(p, pos) < bd
+                    and not self.on_roof(p)):  # we'd walk into its wall
                 best, bd = p, d2(p, pos)
         if me["cubes"] < CUBE_KEEP:
             for p, _ in self.cubes.values():
-                if d2(p, c) < r - 6 and d2(p, pos) < bd:
+                if d2(p, c) < r - 6 and d2(p, pos) < bd and not self.on_roof(p):
                     best, bd = p, d2(p, pos)
         return best
 
