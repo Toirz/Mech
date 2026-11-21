@@ -152,6 +152,7 @@ class Bot:
             self.cubes[c["id"]] = (c["pos"], t)
         seen_p = {p["id"] for p in obs["pickups"]}
         seen_c = {c["id"] for c in obs["cubes"]}
+        seen_m = {m["id"] for m in obs["mechs"]}
         # Close by and not listed: someone took it. Old memories expire.
         self.pickups = {k: v for k, v in self.pickups.items()
                         if (k in seen_p or d2(v[1], pos) > 25) and t - v[2] < 60}
@@ -159,7 +160,7 @@ class Bot:
         for e in obs["events"]:
             if e["type"] == "damaged" and e.get("bearing") is not None:
                 self.threat = (e["bearing"], t)
-                if e.get("rear"):
+                if e.get("rear") or (e.get("by") is not None and e["by"] not in seen_m):  # behind us, or out of view (60-90 deg off)
                     self.turn_to = (e["bearing"], t)
                 if e.get("by") is not None:
                     self.hit_by[e["by"]] = t
@@ -520,7 +521,7 @@ class Bot:
         aim, fire, reload = self.weapons(me, muzzle, tube, T, t)
         if self.turn_to and t - self.turn_to[1] < 1.0 and not (T and T["kind"] == "mech" and T["los"] and T["id"] in self.hit_by
                                                               and t - self.hit_by[T["id"]] < 1.0):
-            aim = [self.turn_to[0], 0.0]  # hit in the back (x1.5) by someone we don't have in front of us: turn round now
+            aim = [self.turn_to[0], 0.0]  # hit by someone we can't see (or in the back, x1.5): turn to it now
             fire = [bool(w and w["kind"] == "laser" and w.get("charge", 0) > 0) for w in me["weapons"]]  # nothing leaves off-aim; a charge is held
 
         # Movement goal.
