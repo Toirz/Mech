@@ -16,6 +16,7 @@ LOOT_RANGE = 90.0    # m: farthest we walk for a weapon or cube
 CUBE_KEEP = 15       # past this, cubes only make us bigger (stats cap at 10; 15 = one more upgrade)
 MORTAR_MIN = 20.0    # m: closer than this our own splash and knockback hurt us
 PATH_BUDGET = 0.01   # s of A* per decision (the whole decision must fit in 50 ms)
+MAP_MARGIN = 15.0    # m: goals stay this far inside the map edge (a wall); the first zone is bigger than the map
 MECH_SOUNDS = {"gun", "mortar", "laser", "laser_charge", "lightning", "step", "boost", "reload", "jet"}
 WEAPON_VALUE = {"laser": 1.0, "lightning": 0.7, "gun": 0.5}  # never a mortar: a laser hit on its carrier cooks off (+60%)
 EARLY_S, EARLY_RANGE = 60.0, 250.0  # the first minute: walk this far for a laser (else a lightning)
@@ -354,16 +355,19 @@ class Bot:
         return None
 
     def free_edge_spot(self, pos, c, r):
-        """edge_spot, slid along the circle to the nearest walkable cell."""
+        """edge_spot, kept inside the map (the first zone is bigger than it), slid along the circle to a walkable cell."""
         spot = edge_spot(pos, c, r, EDGE_MARGIN)
-        if not self.world or self.world.free(*spot):
+        if not self.world:
+            return spot
+        spot = self.world.clamp(spot, MAP_MARGIN)
+        if self.world.free(*spot):
             return spot
         base = math.atan2(spot[1] - c[1], spot[0] - c[0])
         rr = max(r - EDGE_MARGIN, 0.0)
         for k in range(1, 40):
             for s in (1, -1):
                 a = base + s * k * min(0.05, 4 / max(rr, 1))
-                p = [c[0] + math.cos(a) * rr, c[1] + math.sin(a) * rr]
+                p = self.world.clamp([c[0] + math.cos(a) * rr, c[1] + math.sin(a) * rr], MAP_MARGIN)
                 if self.world.free(*p):
                     return p
         return spot

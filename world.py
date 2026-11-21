@@ -14,7 +14,9 @@ import time
 
 CELL = 2.0
 NAV = 2
-BLOCKED = 25.0  # nav cost of a wall/steep cell: crossable (jet over, walk off a roof) but rarely worth it
+BLOCKED = 25.0  # nav cost of a wall/steep cell we can jump: crossable, but rarely worth it
+TALL = 1e4      # nav cost of a wall or cliff taller than a jump: go round (no climbing routine yet)
+CLIMB = 2.5     # m: a jump clears 11^2 / (2 * 22) = 2.75 m
 PATH_WEIGHT = 2.5  # weighted A*: somewhat longer paths, far fewer expansions in Python
 SQ2 = math.sqrt(2)
 NEIGH = [(1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0), (0, -1, 1.0), (1, 1, SQ2), (1, -1, SQ2), (-1, 1, SQ2), (-1, -1, SQ2)]
@@ -77,7 +79,7 @@ class World:
                             if bridge:
                                 surf[idx] = max(surf[idx], pt)
                             elif pt > g + step:
-                                wall[idx] = 1
+                                wall[idx] = max(wall[idx], 2 if pt > g + CLIMB else 1)
 
         # Too steep to walk up (either way, since paths are reused both ways).
         rise = math.tan(math.radians(mech.get("max_slope_deg", 50))) * CELL
@@ -85,20 +87,22 @@ class World:
         for j in range(ny - 1):
             for idx in range(j * nx, j * nx + nx - 1):
                 s = surf[idx]
-                if abs(surf[idx + 1] - s) > rise:
-                    steep[idx] = steep[idx + 1] = 1
-                if abs(surf[idx + nx] - s) > rise:
-                    steep[idx] = steep[idx + nx] = 1
+                for nb in (idx + 1, idx + nx):
+                    dz = abs(surf[nb] - s)
+                    if dz > rise:  # 2: too tall to jump (the terrain also carries some roofs)
+                        v = 2 if dz > CLIMB else 1
+                        steep[idx], steep[nb] = max(steep[idx], v), max(steep[nb], v)
 
         mnx, mny = self.mnx, self.mny = nx // NAV, ny // NAV
         cost = self.cost = array.array("f", [1.0]) * (mnx * mny)
         for J in range(mny):
             for I in range(mnx):
+                w = 0
                 for dj in range(NAV):
                     row = (J * NAV + dj) * nx + I * NAV
-                    if any(wall[row:row + NAV]) or any(steep[row:row + NAV]):
-                        cost[J * mnx + I] = BLOCKED
-                        break
+                    w = max(w, max(wall[row:row + NAV]), max(steep[row:row + NAV]))
+                if w:
+                    cost[J * mnx + I] = TALL if w == 2 else BLOCKED
 
     # --- fine grid ---
     def _idx(self, x, y):
@@ -140,7 +144,12 @@ class World:
         return [self.x0 + (c % self.mnx + 0.5) * s, self.y0 + (c // self.mnx + 0.5) * s]
 
     def free(self, x, y):
-        return self.cost[self.nav_cell(x, y)] <= 1.0
+        I, J = int((x - self.x0) // (CELL * NAV)), int((y - self.y0) // (CELL * NAV))
+        return 0 <= I < self.mnx and 0 <= J < self.mny and self.cost[J * self.mnx + I] <= 1.0  # off the map is not walkable
+
+    def clamp(self, p, m):
+        """p moved at least m inside the map edge (the edge is a wall)."""
+        return [min(max(p[0], self.x0 + m), self.x0 + self.nx * CELL - m), min(max(p[1], self.y0 + m), self.y0 + self.ny * CELL - m)]
 
     def line_free(self, a, b):
         n = int(math.dist(a[:2], b[:2]) / CELL) + 1
