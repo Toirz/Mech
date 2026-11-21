@@ -20,8 +20,7 @@ CUBE_KEEP = 15       # past this, cubes only make us bigger (stats cap at 10; 15
 MORTAR_MIN = 20.0    # m: closer than this our own splash and knockback hurt us
 TRAVEL_LOOK = 260.0  # m: how far along the straight line we look for something to jet over (all the way, in practice)
 TRAVEL_SPAN = 8      # m past its first edge that count as the same obstacle (its tallest part sets the climb)
-TRAVEL_MODES = ("zone", "drop", "hide", "laser", "loot", "roam", "edge")  # bird's flight with the jet
-HURRY_MODES = ("laser", "drop", "loot")  # boost there, sparing only the energy the next jet needs
+LOOT_MODES = ("laser", "drop", "loot")  # fetching: bird's flight with jet and boost; everything else walks (A*)
 SLIDE_AHEAD = 1.2    # m: look this far along the move for walls (one decision at walk speed)
 PATH_BUDGET = 0.01   # s of A* per decision (the whole decision must fit in 50 ms)
 MAP_MARGIN = 15.0    # m: goals stay this far inside the map edge (a wall); the first zone is bigger than the map
@@ -754,8 +753,7 @@ class Bot:
                 if gap < 1.5 and z > top - 1:
                     self.climb = None                  # there: the take / cube pickup happens on its own
         reserve = None
-        if (move is None and self.world and mode in TRAVEL_MODES and gap > arrive
-                and not (T and T["kind"] == "mech" and T["los"] and mode == "edge")):  # edge strafing is below
+        if move is None and self.world and mode in LOOT_MODES and gap > arrive:
             tr = self.travel(me, pos, goal)
             if tr:
                 move, climbing, reserve = tr
@@ -796,8 +794,7 @@ class Bot:
         if reserve is not None and not climbing and not stuck:
             # flying straight: in the air boost is the jet, so only on the ground, and never into the next climb's energy
             spare = me["energy"] > reserve + 10
-            boost = me["grounded"] and spare and (mode == "zone" or (mode in HURRY_MODES and gap > 6)
-                                                   or (gap > 40 and me["energy"] > 60 and not T))
+            boost = me["grounded"] and spare and gap > 6
         if fighting:  # boost through the whole fight, walking just long enough to recharge (duel-tested; jets lost)
             self.burn = me["energy"] > 70 if not self.burn else me["energy"] > 25
             boost = boost or (self.burn and me["grounded"])
