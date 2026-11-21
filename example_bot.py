@@ -106,6 +106,15 @@ def shell_landing(pos, vel, g, floor_z):
     return pos[0] + vel[0] * t, pos[1] + vel[1] * t, t
 
 
+def bullet_miss(p, v, c):
+    """(seconds until a straight bullet at p moving at v is closest to point c, vector from that closest point to c)."""
+    vv = sum(x * x for x in v)
+    if vv < 1e-9:
+        return -1.0, [0.0, 0.0, 0.0]
+    tca = sum((c[i] - p[i]) * v[i] for i in range(3)) / vv
+    return tca, [c[i] - (p[i] + v[i] * tca) for i in range(3)]
+
+
 def unit(dx, dy):
     d = math.hypot(dx, dy)
     return [dx / d, dy / d] if d > 1e-6 else [0.0, 0.0]
@@ -486,6 +495,14 @@ class Bot:
                 if land and land[2] < 3 and d2(land, pos) < mo["splash_radius"] * 1.3 + 3:
                     v = unit(pos[0] - land[0], pos[1] - land[1])
                     return (v if v != [0.0, 0.0] else [-p["vel"][1], p["vel"][0]]), "dodge shell"
+        c = [pos[0], pos[1], pos[2] + self.mech["height"] / 2]
+        for p in obs["projectiles"]:  # a bullet headed for our body: step out of its line (at 100 m it flies 0.4 s)
+            if p["kind"] != "mortar":
+                tca, miss = bullet_miss(p["pos"], p["vel"], c)
+                if 0 < tca < 0.6 and math.hypot(*miss[:2]) < self.mech["radius"] + 1.0:
+                    side = unit(miss[0], miss[1]) if math.hypot(*miss[:2]) > 0.3 else [v * self.strafe_sign for v in
+                                                                                     unit(-p["vel"][1], p["vel"][0])]
+                    return side, "dodge bullet"
         return None
 
     def free_edge_spot(self, pos, c, r):
@@ -671,7 +688,7 @@ class Bot:
                 a = math.atan2(move[1], move[0]) + self.rng.choice((-1, 1)) * math.pi / 2
                 self.unstick_dir, self.unstick_until = [math.cos(a), math.sin(a)], t + 1.0
                 self.stuck_since, self.path = None, []
-        boost = mode in ("dodge shell", "zone") or (stuck and not fighting) or (
+        boost = mode in ("dodge shell", "dodge bullet", "zone") or (stuck and not fighting) or (
             gap > 40 and me["energy"] > 60 and not T)
         if fighting:  # boost through the whole fight, walking just long enough to recharge (duel-tested; jets lost)
             self.burn = me["energy"] > 70 if not self.burn else me["energy"] > 25

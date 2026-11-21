@@ -3,7 +3,7 @@ import math
 import os
 import random
 
-from example_bot import edge_spot, lead, mortar_aim, shell_landing, zone_at
+from example_bot import ang_diff, bullet_miss, edge_spot, lead, mortar_aim, shell_landing, zone_at
 
 zone = {"center": [0, 0], "radius": 500, "next_center": [100, 0], "next_radius": 300, "shrink_start": 60, "shrink_end": 110}
 assert zone_at(zone, 0) == ([0, 0], 500)
@@ -35,6 +35,12 @@ assert mortar_aim([0, 0, 0], [1000, 0, 0], [0, 0, 0], v, g) is None  # out of ra
 x, y, lt = shell_landing([0, 0, 50], [10, 0, 5], g, 0)
 assert abs(50 + 5 * lt - g * lt * lt / 2) < 1e-9 and abs(x - 10 * lt) < 1e-9
 
+# bullet_miss: time and offset of the closest approach.
+tca, miss = bullet_miss([0, 0, 5], [100, 0, 0], [50, 2, 5])
+assert abs(tca - 0.5) < 1e-9 and math.dist(miss, [0, 2, 0]) < 1e-9
+assert bullet_miss([0, 0, 5], [-100, 0, 0], [50, 2, 5])[0] < 0  # flying away
+assert bullet_miss([0, 0, 0], [0, 0, 0], [1, 1, 1])[0] < 0      # not moving
+
 # Map model, when the kit's arena folder is next to this one.
 arena = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "arena")
 if os.path.isdir(arena):
@@ -56,3 +62,31 @@ if os.path.isdir(arena):
             reached += math.dist(path[-1], b) < 1
     assert reached > 0
 print("ok")
+
+# Ghosts: a sound from out of view leaves a guess; we turn to it, and once we see the spot empty it is dropped.
+stream = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "check", "stream.jsonl.gz")
+if os.path.exists(stream):
+    import copy, gzip, json
+    from example_bot import Bot
+    msgs = [json.loads(l) for _, l in zip(range(3), gzip.open(stream, "rt"))]
+    hello = msgs[0]
+    hello["map"]["dir"] = "/nonexistent"  # no map: every line is clear, so the test is about the logic only
+    bot = Bot(hello)
+    base = next(m for m in msgs if m.get("type") == "obs")
+    for k in ("mechs", "projectiles", "crates", "cubes", "pickups", "sounds", "beams", "events", "drops"):
+        base[k] = []
+    base["offer"] = None
+    me = base["self"]
+    me["aim"] = [math.pi, 0.0]  # looking west
+    o = copy.deepcopy(base)
+    o["t"], o["tick"] = 10.0, 200
+    o["sounds"] = [{"kind": "laser", "bearing": 0.0, "dist": "mid", "age": 0.0}]  # east, 60-160 m
+    a = bot.act(o)
+    assert len(bot.ghosts) == 1 and abs(bot.ghosts[0][0] - (me["pos"][0] + 110)) < 1e-6
+    assert abs(ang_diff(a["aim"][0], 0.0)) < 1e-6, a["aim"]  # turn to it
+    o = copy.deepcopy(base)
+    o["t"], o["tick"] = 11.0, 220
+    o["self"]["aim"] = [0.0, 0.0]  # now facing it, nobody there
+    bot.act(o)
+    assert bot.ghosts == [], bot.ghosts
+    print("ghosts ok")
