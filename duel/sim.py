@@ -3,7 +3,7 @@
 It is NOT the real server: it models what matters for a duel (movement with walls and ledges, aim
 slewing, gun / laser / lightning / mortar exactly as protocol.md §7 describes them, rear armor,
 vision with buildings and canopy, sound, a shrinking zone, HP and energy regen) and leaves out
-crates, NPCs, cubes, upgrades and supply drops. Bots are real subprocesses speaking the protocol in
+NPCs, cubes, upgrades and supply drops (crates and weapon loot are in, for --loot). Bots are real subprocesses speaking the protocol in
 lockstep: obs at tick N, the action holds for ticks N and N+1.
 """
 import array
@@ -264,6 +264,30 @@ class BotProc:
 
 
 # ------------------------------------------------------------------ match
+def make_weapon(cfg, kind):
+    st = dict(cfg["weapons"][kind])
+    w = {"kind": kind, "cooldown": 0.0, "equip": 0.0, "stats": st}
+    if kind == "gun":
+        w.update(ammo=int(st["mag"]), reload=0.0)
+    if kind == "laser":
+        w.update(charge=0.0)
+    return w
+
+
+class Crate:
+    """A loot crate: shootable, never moves; destroyed it may leave a weapon."""
+    is_crate = True
+
+    def __init__(self, cid, pos, cfg):
+        c = cfg["crates"]
+        self.id, self.pos, self.hp = cid, list(pos), float(c["hp"])
+        self.mc = {"radius": c["radius"], "height": c["height"]}
+        self.alive = True
+
+    def holds(self, kind):
+        return False
+
+
 class Mech:
     def __init__(self, mid, pos, yaw, cfg, loadout):
         mc = cfg["mech"]
@@ -281,15 +305,7 @@ class Mech:
         self.last_ok, self.last_answer_t = {}, 0.0
 
     def weapon(self, kind):
-        if kind is None:
-            return None
-        st = dict(self.cfg["weapons"][kind])
-        w = {"kind": kind, "cooldown": 0.0, "equip": 0.0, "stats": st}
-        if kind == "gun":
-            w.update(ammo=int(st["mag"]), reload=0.0)
-        if kind == "laser":
-            w.update(charge=0.0)
-        return w
+        return None if kind is None else make_weapon(self.cfg, kind)
 
     def holds(self, kind):
         return any(w and w["kind"] == kind for w in self.weapons)
@@ -299,15 +315,19 @@ class Mech:
 
 
 class Match:
-    def __init__(self, arena, map_dir, hello_cfg, bots, spawns, loadouts, zone, seed, max_t=180.0, timeout=0.2, log_dir=None):
+    def __init__(self, arena, map_dir, hello_cfg, bots, spawns, loadouts, zone, seed, max_t=180.0, timeout=0.2, log_dir=None, loot=None):
         """bots: [(cmd, cwd)] for mech ids 0 and 1; spawns: [[x, y, z, yaw]]; loadouts: [[kind, kind|None]]."""
         self.A, self.map_dir, self.cfg = arena, map_dir, json.loads(json.dumps(hello_cfg))
         self.rng = random.Random(seed)
         self.zone_def, self.max_t, self.timeout = zone, max_t, timeout
         self.t, self.tick = 0.0, 0
         self.mechs = [Mech(i, s[:3], s[3], self.cfg, loadouts[i]) for i, s in enumerate(spawns)]
-        self.projectiles, self.pickups = [], []
+        self.projectiles, self.pickups, self.crates = [], [], []
         self.next_id = {"proj": 1, "pick": 8000}
+        for kind, pos in (loot or {}).get("floor", []):
+            self.add_pickup(make_weapon(self.cfg, kind), pos)
+        for k, pos in enumerate((loot or {}).get("crates", [])):
+            self.crates.append(Crate(1000 + k, pos, self.cfg))
         self.stats = [{"shots": {}, "hits": {}, "dmg": {}, "late": 0} for _ in self.mechs]
         self.procs = [BotProc(cmd, cwd, os.path.join(log_dir, f"bot{i}.log") if log_dir else None) for i, (cmd, cwd) in enumerate(bots)]
         self.names = ["?"] * len(self.mechs)
@@ -346,9 +366,32 @@ class Match:
                 m.sounds.append((kind, (b + math.pi) % (2 * math.pi) - math.pi,
                                  "near" if d < sd["near"] else "mid" if d < sd["mid"] else "far", self.t))
 
+    def shootables(self):
+        return [x for x in self.mechs if x.alive] + [c for c in self.crates if c.alive]
+
+    def random_weapon(self):
+        ws = self.cfg["loot"]["weights"]
+        kinds = [k for k in sorted(ws) if ws[k] > 0]
+        return self.rng.choices(kinds, [ws[k] for k in kinds])[0]
+
+    def add_pickup(self, w, pos):
+        pid = self.next_id["pick"]
+        self.next_id["pick"] += 1
+        self.pickups.append({"id": pid, "kind": w["kind"], "pos": list(pos), "w": w})
+        return pid
+
     def damage(self, tgt, amount, weapon, src_pos, by, effect=None, record=True):
         if not tgt.alive or amount <= 0:
             return 0.0
+        if getattr(tgt, "is_crate", False):
+            tgt.hp -= amount
+            by.events.append({"type": "hit", "target": tgt.id, "amount": round(amount, 1), "weapon": weapon})
+            if tgt.hp <= 0:
+                tgt.alive = False
+                self.emit("crate", tgt.pos, None)
+                if self.rng.random() < self.cfg["loot"]["crate_weapon_chance"]:
+                    self.add_pickup(make_weapon(self.cfg, self.random_weapon()), tgt.pos)
+            return amount
         yaw_src = math.atan2(src_pos[1] - tgt.pos[1], src_pos[0] - tgt.pos[0])
         rear = abs(ang_diff(yaw_src, tgt.aim[0])) > math.radians(tgt.mc["front_arc_deg"]) / 2
         amt = amount * (tgt.mc["rear_mult"] if rear else 1.0) * (1 - tgt.mc["armor"])
@@ -375,6 +418,7 @@ class Match:
                 s["dmg"][weapon] = s["dmg"].get(weapon, 0.0) + amt
         if tgt.hp <= 0:
             tgt.hp, tgt.alive, tgt.died = 0.0, False, self.tick
+            self.death_drop(tgt)
             if by is not tgt:
                 by.events.append({"type": "kill", "target": tgt.id})
             self.emit("death", tgt.pos, tgt)
@@ -383,6 +427,16 @@ class Match:
     def nearest_foe(self, m):
         foes = [x for x in self.mechs if x is not m and x.alive] or [x for x in self.mechs if x is not m]
         return min(foes, key=lambda x: math.dist(m.pos, x.pos))
+
+    def death_drop(self, m):
+        if not self.cfg["loot"].get("death_drop", 1):
+            return
+        for i, w in enumerate(m.weapons):
+            if w and w["kind"] != "gun":
+                if w["kind"] == "laser":
+                    w["charge"] = 0.0
+                self.add_pickup(w, m.pos)
+                m.weapons[i] = None
 
     def count_shot(self, m, kind, hit):
         foe = self.nearest_foe(m)
@@ -409,8 +463,8 @@ class Match:
         o = self.shot_origin(m, origin_h, dirv)
         end = [o[i] + dirv[i] * rng_ for i in range(3)]
         best, hitm = 1.0, None
-        for x in self.mechs:
-            if x is m or not x.alive:
+        for x in self.shootables():
+            if x is m:
                 continue
             f = seg_cylinder(o, end, x.pos[0], x.pos[1], x.pos[2], x.pos[2] + x.mc["height"], x.mc["radius"])
             if f is not None and f < best:
@@ -470,8 +524,8 @@ class Match:
                     w["cooldown"] += st["cooldown"]
                     mz = [m.pos[0], m.pos[1], m.pos[2] + mh]
                     best = None
-                    for x in self.mechs:
-                        if x is m or not x.alive:
+                    for x in self.shootables():
+                        if x is m:
                             continue
                         c = [x.pos[0], x.pos[1], x.pos[2] + x.mc["height"] / 2]
                         d = math.dist(mz, c)
@@ -482,7 +536,7 @@ class Match:
                     if best:
                         x = best[1]
                         eff = None
-                        if x.holds("laser"):
+                        if not getattr(x, "is_crate", False) and x.holds("laser"):
                             eff = "short"
                             x.short_until = self.t + st["short_s"]
                             for lw in x.weapons:
@@ -493,8 +547,8 @@ class Match:
                         hit_ids, cur, dmg = {x.id}, best[2], st["damage"]
                         for _ in range(int(st.get("chain", 0))):  # jumps to the nearest other target in chain_range
                             dmg *= st.get("chain_falloff", 0.7)
-                            nxt = min(((math.dist(cur, [y.pos[0], y.pos[1], y.pos[2] + y.mc["height"] / 2]), y) for y in self.mechs
-                                       if y.alive and y is not m and y.id not in hit_ids), default=None, key=lambda e: e[0])
+                            nxt = min(((math.dist(cur, [y.pos[0], y.pos[1], y.pos[2] + y.mc["height"] / 2]), y) for y in self.shootables()
+                                       if y is not m and y.id not in hit_ids), default=None, key=lambda e: e[0])
                             if nxt is None or nxt[0] > st.get("chain_range", 14):
                                 break
                             y = nxt[1]
@@ -509,7 +563,7 @@ class Match:
                         d = direction(m.aim[0], m.aim[1])
                         o, end, _ = self.hitscan(m, d, st["range"], mh)
                         path = [mz, end]
-                    self.count_shot(m, "lightning", best is not None)
+                    self.count_shot(m, "lightning", best is not None and not getattr(best[1], "is_crate", False))
                     for x in self.mechs:
                         if x is not m:
                             x.beams.append({"by": m.id, "kind": "lightning", "path": [[round(v, 2) for v in p] for p in path], "t": self.t})
@@ -541,7 +595,7 @@ class Match:
                     if hitm:
                         cook = hitm.holds("mortar")
                         self.damage(hitm, dmg * (1 + st["cookoff"] if cook else 1.0), "laser", o, m, "cookoff" if cook else None)
-                    self.count_shot(m, "laser", hitm is not None)
+                    self.count_shot(m, "laser", hitm is not None and not getattr(hitm, "is_crate", False))
                     for x in self.mechs:
                         if x is not m:
                             x.beams.append({"by": m.id, "kind": "laser", "path": [[round(v, 2) for v in o], [round(v, 2) for v in end]], "t": self.t})
@@ -551,8 +605,10 @@ class Match:
     def explode(self, p, st, by, direct):
         R, edge = st["splash_radius"], st["splash_edge"]
         hit_foe = False
-        for x in self.mechs:
-            if not x.alive:
+        for x in self.shootables():
+            if getattr(x, "is_crate", False):
+                if math.dist(p, x.pos) <= R + x.mc["radius"]:
+                    self.damage(x, st["damage"] if x is direct else st["splash"] * edge, "mortar", p, by)
                 continue
             z0, z1 = x.pos[2], x.pos[2] + x.mc["height"]
             cz = min(max(p[2], z0), z1)
@@ -593,8 +649,8 @@ class Match:
                     q = [p["pos"][i] + (q[i] - p["pos"][i]) * p["left"] / step for i in range(3)]
                 p["left"] -= step
             best, hitm = 1.0 + 1e-9, None
-            for x in self.mechs:
-                if x is p["by"] or not x.alive:
+            for x in self.shootables():
+                if x is p["by"]:
                     continue
                 f = seg_cylinder(p["pos"], q, x.pos[0], x.pos[1], x.pos[2], x.pos[2] + x.mc["height"], x.mc["radius"] + (pr if p["kind"] == "gun" else 0))
                 if f is not None and f < best:
@@ -607,7 +663,7 @@ class Match:
             if p["kind"] == "gun":
                 if hitm:
                     self.damage(hitm, p["dmg"], "gun", p["pos"], p["by"])
-                    p["hit"] = True
+                    p["hit"] = not getattr(hitm, "is_crate", False)
                 if done or p["left"] <= 0:
                     self.record_proj(p)
                     continue
@@ -761,6 +817,7 @@ class Match:
                 m.events.append({"type": "damaged", "amount": round(dps * DT, 1), "weapon": "zone", "bearing": None, "by": None})
             if m.hp <= 0:
                 m.hp, m.alive, m.died = 0.0, False, self.tick
+                self.death_drop(m)
                 self.emit("death", m.pos, m)
                 return
         elif self.t - m.last_fight >= mc["regen_delay"]:
@@ -820,12 +877,14 @@ class Match:
                  or self.sees_point(o, b["path"][-1])]
         sounds = [{"kind": k, "bearing": round(bb, 4), "dist": dd, "age": round(self.t - ts, 2)} for k, bb, dd, ts in o.sounds]
         pick = [{"id": p["id"], "kind": p["kind"], "pos": r2(p["pos"])} for p in self.pickups if self.sees_point(o, [p["pos"][0], p["pos"][1], p["pos"][2] + 0.5])]
+        crates = [{"id": c.id, "pos": r2(c.pos), "hp": round(c.hp)} for c in self.crates if c.alive
+                  and self.sees_point(o, [c.pos[0], c.pos[1], c.pos[2] + c.mc["height"] / 2])]
         obs = {"type": "obs", "tick": self.tick, "t": round(self.t, 2), "alive": sum(x.alive for x in self.mechs),
                "self": {"id": o.id, "pos": r2(o.pos), "vel": r2(o.vel), "aim": r2(o.aim), "hp": round(o.hp, 1), "max_hp": o.max_hp,
                         "energy": round(o.energy, 1), "max_energy": o.max_energy, "grounded": o.grounded, "cubes": 0, "upgrades": [],
                         "weapons": [self.weapon_obs(w) if w else None for w in o.weapons], "in_zone": getattr(o, "in_zone", True),
                         "stats": dict(o.mc)},
-               "mechs": mechs, "projectiles": projs, "crates": [], "cubes": [], "pickups": pick, "sounds": sounds,
+               "mechs": mechs, "projectiles": projs, "crates": crates, "cubes": [], "pickups": pick, "sounds": sounds,
                "beams": beams, "events": o.events, "zone": self.zone(), "offer": None, "drops": []}
         o.events, o.sounds, o.beams = [], [], []
         return obs
@@ -883,6 +942,8 @@ class Match:
             w["equip"] = max(self.cfg["loot"]["equip_s"], w["stats"]["cooldown"])
             m.weapons[slot] = w
             m.events.append({"type": "took", "id": p["id"], "kind": w["kind"], "slot": slot})
+            if w["kind"] == "laser" and getattr(m, "laser_t", None) is None:
+                m.laser_t = self.t
         elif drop is not None:
             self.drop_slot(m, drop)
 
@@ -892,9 +953,7 @@ class Match:
             return
         if w["kind"] == "laser":
             w["charge"] = 0.0
-        pid = self.next_id["pick"]
-        self.next_id["pick"] += 1
-        self.pickups.append({"id": pid, "kind": w["kind"], "pos": list(m.pos), "w": w})
+        pid = self.add_pickup(w, m.pos)
         m.weapons[slot] = None
         m.events.append({"type": "dropped", "id": pid, "kind": w["kind"], "slot": slot})
 
@@ -1018,20 +1077,22 @@ def duel_setup(arena, rng, dmin=90.0, dmax=170.0, max_t=180.0):
     raise RuntimeError("no duel spawn found")
 
 
-def ffa_setup(arena, rng, n, sep=90.0):
-    """n spawns on open ground at least `sep` m apart inside a circle, and a zone that closes on them over ~3 min."""
+def ffa_setup(arena, rng, n, sep=130.0):
+    """n spawns on open ground at least `sep` m apart, at the real match's density (16 mechs on the ~775,000 m2
+    campus: ~48,000 m2 each), and a zone that closes like the real one's (radius fractions 1, .68, .43, .25,
+    .125, .045, 0) a little faster."""
     A = arena
-    for _ in range(200):
-        R0 = 60 + 40 * math.sqrt(n)
-        cx = rng.uniform(A.minx + R0 * 0.6, A.maxx - R0 * 0.6)
-        cy = rng.uniform(A.miny + R0 * 0.6, A.maxy - R0 * 0.6)
+    R0 = math.sqrt(48000.0 * n / math.pi)
+    for _ in range(300):
+        cx = rng.uniform(A.minx + R0 * 0.5, A.maxx - R0 * 0.5)
+        cy = rng.uniform(A.miny + R0 * 0.5, A.maxy - R0 * 0.5)
         pts = []
-        for _ in range(4000):
+        for _ in range(6000):
             if len(pts) == n:
                 break
-            a, d = rng.uniform(-math.pi, math.pi), R0 * 0.85 * math.sqrt(rng.random())
+            a, d = rng.uniform(-math.pi, math.pi), R0 * 0.8 * math.sqrt(rng.random())
             x, y = cx + math.cos(a) * d, cy + math.sin(a) * d
-            if not (A.minx + 20 < x < A.maxx - 20 and A.miny + 20 < y < A.maxy - 20):
+            if not (A.minx + 25 < x < A.maxx - 25 and A.miny + 25 < y < A.maxy - 25):
                 continue
             if any(math.hypot(x - p[0], y - p[1]) < sep for p in pts):
                 continue
@@ -1049,18 +1110,46 @@ def ffa_setup(arena, rng, n, sep=90.0):
                 pts.append([x, y, g, rng.uniform(-math.pi, math.pi)])
         if len(pts) < n:
             continue
-
-        def inner(c, r, rn):
-            a, d = rng.uniform(-math.pi, math.pi), rng.uniform(0, max(r - rn, 0) * 0.6)
-            return [c[0] + math.cos(a) * d, c[1] + math.sin(a) * d]
-        c0 = [cx, cy]
-        c1 = inner(c0, R0, R0 * 0.6)
-        c2 = inner(c1, R0 * 0.6, R0 * 0.3)
-        c3 = inner(c2, R0 * 0.3, R0 * 0.1)
-        zone = {"center": c0, "radius": R0, "phases": [
-            {"hold_s": 30, "shrink_s": 35, "radius": R0 * 0.6, "dps": 20, "center": c1},
-            {"hold_s": 25, "shrink_s": 30, "radius": R0 * 0.3, "dps": 35, "center": c2},
-            {"hold_s": 20, "shrink_s": 25, "radius": R0 * 0.1, "dps": 60, "center": c3},
-            {"hold_s": 15, "shrink_s": 20, "radius": 0, "dps": 160, "center": c3}]}
-        return pts, zone
+        phases, c, r = [], [cx, cy], R0
+        for hold, shrink, frac, dps in ((45, 35, 0.68, 20), (30, 30, 0.43, 35), (25, 25, 0.25, 60), (20, 20, 0.125, 100),
+                                        (15, 15, 0.045, 160), (10, 20, 0.0, 260)):
+            rn = R0 * frac
+            a, d = rng.uniform(-math.pi, math.pi), rng.uniform(0, max(r - rn, 0) * 0.7)
+            nc = [c[0] + math.cos(a) * d, c[1] + math.sin(a) * d]
+            phases.append({"hold_s": hold, "shrink_s": shrink, "radius": rn, "dps": dps, "center": nc})
+            c, r = nc, rn
+        return pts, {"center": [cx, cy], "radius": R0, "phases": phases}
     raise RuntimeError("no ffa spawns found")
+
+
+def loot_setup(arena, rng, center, radius, n_floor, n_crates, weights, roof_fraction=0.25):
+    """Floor weapons (a share on flat roofs within jet reach) and crates on open ground inside the circle."""
+    A = arena
+    kinds = [k for k in sorted(weights) if weights[k] > 0]
+
+    def spot(roof):
+        for _ in range(3000):
+            a, d = rng.uniform(-math.pi, math.pi), radius * math.sqrt(rng.random())
+            x, y = center[0] + math.cos(a) * d, center[1] + math.sin(a) * d
+            i = A.idx(x, y)
+            if i < 0:
+                continue
+            g = A.ground(x, y)
+            if roof:
+                h = A.hi[i]
+                if not (g + 4 < h < g + 50 and A.lo[i] <= g + 1):
+                    continue
+                if all(A.idx(x + dx, y + dy) >= 0 and abs(A.hi[A.idx(x + dx, y + dy)] - h) < 0.3
+                       for dx in (-2, 0, 2) for dy in (-2, 0, 2)):
+                    return [x, y, h]
+            elif A.lo[i] > g + 12 and all(A.idx(x + dx, y + dy) >= 0 and A.lo[A.idx(x + dx, y + dy)] > g + 12
+                                         for dx in (-3, 0, 3) for dy in (-3, 0, 3)):
+                return [x, y, g]
+        return None
+    floor = []
+    for k in range(n_floor):
+        p = spot(rng.random() < roof_fraction) or spot(False)
+        if p:
+            floor.append((rng.choices(kinds, [weights[x] for x in kinds])[0], p))
+    crates = [p for p in (spot(rng.random() < roof_fraction) or spot(False) for _ in range(n_crates)) if p]
+    return {"floor": floor, "crates": crates}

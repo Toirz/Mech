@@ -6,7 +6,7 @@
 
 The first bot is the candidate: WORK (the working tree), a git revision, or a folder. Every other bot
 is an opponent; the first opponent is the baseline the verdict is about. Each round is a pair of games
-on the same spawns and zone with the sides swapped, so neither bot gets the better spawn. Games run in
+on the same spawns and zone with the bots trading mechs (id, spawn, loadout), so neither gets the better side. Games run in
 duel/sim.py (an approximation of the server written from protocol.md, see its docstring).
 
 Output: wins / losses / draws per opponent, the win rate with a sign-test p-value, per-weapon hit
@@ -112,10 +112,9 @@ def play(job):
         lo = [LOADOUTS[rng.choice(sorted(LOADOUTS))], LOADOUTS[rng.choice(sorted(LOADOUTS))]]
     else:
         lo = [LOADOUTS[a.loadout], LOADOUTS[a.loadout]]
-    if swapped:
-        spawns = spawns[::-1]
-        lo = lo[::-1]
-    bots = [(["python3", "-u", "example_bot.py"], cand_dir), (["python3", "-u", "example_bot.py"], opp_dir)]  # BOT_DEBUG=1 in the env: debug counters in --logs
+    bots = [(["python3", "-u", "example_bot.py"], cand_dir), (["python3", "-u", "example_bot.py"], opp_dir)]
+    if swapped:  # the candidate takes the other mech: its id, spawn and loadout (so id, seed and spawn effects cancel)
+        bots = bots[::-1]
     log_dir = None
     if a.logs:
         log_dir = os.path.join(a.logs, f"o{oi}-r{rnd}-{'b' if swapped else 'a'}")
@@ -123,6 +122,10 @@ def play(job):
     m = sim.Match(G["arena"], G["map_dir"], G["cfg"], bots, spawns, lo, zone, seed=rng.randrange(1 << 30),
                   max_t=a.max_t, timeout=a.timeout, log_dir=log_dir)
     res = m.run()
+    if swapped:  # report from the candidate's side: index 0 is always the candidate
+        res["stats"], res["hp"], res["names"] = res["stats"][::-1], res["hp"][::-1], res["names"][::-1]
+        res["winner"] = None if res["winner"] is None else 1 - res["winner"]
+        lo = lo[::-1]
     res.update(opp=oi, round=rnd, swapped=swapped, loadout=[[k for k in l if k] for l in lo])
     return res
 
@@ -135,11 +138,19 @@ def play_ffa(job):
     rng = random.Random(a.seed * 1000003 + rnd)
     spawns, zone = sim.ffa_setup(G["arena"], rng, n)
     kinds = [sorted(LOADOUTS)[rng.randrange(len(LOADOUTS))] if a.loadout == "mixed" else a.loadout for _ in range(n)]
+    loot = None
+    if a.loot:  # like a match: gun only, the rest is loot (density of 16 mechs on the real map)
+        kinds = ["gun"] * n
+        lc = G["cfg"]["loot"]
+        loot = sim.loot_setup(G["arena"], rng, zone["center"], zone["radius"] * 0.95, round(2.5 * n), round(2.25 * n),
+                              lc["weights"], lc.get("floor_roof_fraction", 0.25))
     side = [(i % 2 == 0) != swapped for i in range(n)]  # True = candidate
     bots = [(["python3", "-u", "example_bot.py"], cand_dir if c else opp_dir) for c in side]
     m = sim.Match(G["arena"], G["map_dir"], G["cfg"], bots, spawns, [LOADOUTS[k] for k in kinds], zone, seed=rng.randrange(1 << 30),
-                  max_t=a.max_t, timeout=a.timeout)
+                  max_t=a.max_t, timeout=a.timeout, loot=loot)
     res = m.run()
+    res["held"] = [[w["kind"] for w in x.weapons if w] for x in m.mechs]
+    res["laser_t"] = [getattr(x, "laser_t", None) for x in m.mechs]
     pts = [n - p for p in res["places"]]
     res.update(opp=oi, round=rnd, swapped=swapped, side=side,
                cand=sum(p for p, c in zip(pts, side) if c) / sum(side), base=sum(p for p, c in zip(pts, side) if not c) / (n - sum(side)))
@@ -164,6 +175,12 @@ def ffa_report(a, results, cand_label, opps):
         print(f"\n=== FFA of {a.ffa} ({a.ffa // 2} {cand_label} vs {a.ffa - a.ffa // 2} {label}), {len(rs)} games: "
               f"points per mech {cand_label} {cpts:.2f} vs {label} {bpts:.2f} (max {a.ffa - 1}); "
               f"difference {mean:+.2f} +- {se:.2f}; rounds won {w}-{l} (sign test p = {p:.3f})")
+        if a.loot:
+            for c, name in ((True, cand_label), (False, label)):
+                lt = [r["laser_t"][i] for r in rs for i, isc in enumerate(r["side"]) if isc == c]
+                got = [x for x in lt if x is not None]
+                print(f"  {name:>10}: took a laser in {100 * len(got) / len(lt):.0f}% of lives"
+                      + (f", median at {sorted(got)[len(got) // 2]:.0f} s" if got else ""))
         for c, name in ((True, cand_label), (False, label)):
             tk, n = {}, 0
             for r in rs:
@@ -230,6 +247,7 @@ def main():
     ap.add_argument("--alpha", type=float, default=0.1, help="sign-test p-value for KEEP / REJECT")
     ap.add_argument("--logs", help="folder for each game's bot stderr")
     ap.add_argument("--json", help="write every game's result here")
+    ap.add_argument("--loot", action="store_true", help="with --ffa: everyone starts with the gun; weapons lie on the ground and in crates")
     ap.add_argument("--ffa", type=int, default=0, help="free-for-all of this many mechs (half candidate, half the first opponent), "
                     "scored like the server: N - place per mech")
     a = ap.parse_args()
@@ -252,7 +270,7 @@ def main():
     t0 = time.time()
     ctx = mp.get_context("fork")
     if a.ffa:
-        a.max_t = max(a.max_t, 260.0)
+        a.max_t = max(a.max_t, 340.0)
         jobs = [(0, r, sw, cand_dir, opps[0][1]) for r in range(a.rounds) for sw in (False, True)]
         with ctx.Pool(a.jobs, initializer=init_worker, initargs=(arena, map_dir, cfg, a)) as pool:
             for i, res in enumerate(pool.imap_unordered(play_ffa, jobs), 1):
