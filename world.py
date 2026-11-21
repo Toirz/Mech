@@ -18,6 +18,7 @@ FINE = 1.0  # m: the shot grid
 NAV = 2
 BLOCKED = 25.0  # nav cost of a wall/steep cell we can jump: crossable, but rarely worth it
 TALL = 1e4      # nav cost of a wall or cliff taller than a jump: go round (no climbing routine yet)
+NARROW = 3.0    # nav cost of a free cell beside a tall wall (soft: narrow ways stay open, wide ones are preferred)
 CLIMB = 2.5     # m: a jump clears 11^2 / (2 * 22) = 2.75 m
 PATH_WEIGHT = 2.5  # weighted A*: somewhat longer paths, far fewer expansions in Python
 SQ2 = math.sqrt(2)
@@ -135,6 +136,14 @@ class World:
                     w = max(w, max(wall[row:row + NAV]), max(steep[row:row + NAV]))
                 if w:
                     cost[J * mnx + I] = TALL if w == 2 else BLOCKED
+        if NARROW > 1.0:  # next to a tall wall: a 5 m-wide mech scrapes it or jams in a gap narrower than itself
+            tall = [c >= TALL for c in cost]
+            for J in range(mny):
+                for I in range(mnx):
+                    k = J * mnx + I
+                    if cost[k] <= 1.0 and any(tall[jj * mnx + ii] for jj in range(max(J - 1, 0), min(J + 2, mny))
+                                              for ii in range(max(I - 1, 0), min(I + 2, mnx))):
+                        cost[k] = NARROW
 
     # --- fine grid ---
     def _idx(self, x, y):
@@ -187,7 +196,7 @@ class World:
 
     def free(self, x, y):
         I, J = int((x - self.x0) // (CELL * NAV)), int((y - self.y0) // (CELL * NAV))
-        return 0 <= I < self.mnx and 0 <= J < self.mny and self.cost[J * self.mnx + I] <= 1.0  # off the map is not walkable
+        return 0 <= I < self.mnx and 0 <= J < self.mny and self.cost[J * self.mnx + I] <= NARROW  # off the map is not walkable
 
     def clamp(self, p, m):
         """p moved at least m inside the map edge (the edge is a wall)."""
