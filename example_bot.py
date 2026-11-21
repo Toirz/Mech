@@ -5,6 +5,7 @@ Priorities each decision (movement): dodge a laser/shell > get back in the zone 
 """
 import math
 import random
+import time
 
 import mechfight as mf
 from world import World
@@ -30,6 +31,9 @@ STICKY = 0.7         # a new target must score this much better (lower) than the
 AVOID = 0.5          # their kill time / ours under this: far stronger than us, keep away from it
 FLANK_S = 8.0        # s working round an unaware mech before we just shoot (if we win)
 FLANK_D = (50.0, 110.0)  # m behind it we go to
+COVER_NEAR = 30.0    # m: losing a fight, fall back to cover only this close (farther, stand and fight)
+PEEK_S = 1.5         # s out of cover for one shot before stepping back
+AMBUSH_S = 1.0       # s: a foe about to come round the corner this soon finds our laser charged and waiting
 # Upgrade order, one entry per stack; with lightning in hand its two upgrades come right after laser_charge.
 UPGRADE_PLAN = ["plating", "laser_damage", "nanites", "plating", "laser_damage", "laser_charge", "plating", "armor",
                 "gun_damage", "gun_rate", "sensors", "armor", "gyros"]
@@ -158,6 +162,8 @@ class Bot:
         self.busy, self.hp_seen = {}, {}  # mech id -> last time it fought someone else / (hp, t) last seen
         self.target_id = None
         self.flank_from = None           # (mech id, t) we started working round
+        self.hide = None                 # (spot [x, y], t chosen): out of sight of whoever we're losing to
+        self.peek_until, self.next_peek, self.peek_from, self.peek_charged = -1.0, 0.0, None, False
 
     # ----- memory -----
     def remember(self, obs, t, pos):
@@ -373,8 +379,8 @@ class Bot:
                     return x
         return None
 
-    def weapons(self, me, muzzle, tube, T, t):
-        """(aim or None, fire[2], reload)."""
+    def weapons(self, me, muzzle, tube, T, t, precharge=False):
+        """(aim or None, fire[2], reload). precharge: start the laser behind cover, with no line to T yet."""
         ws, now = me["weapons"], me["aim"]
         aims, ok, tol = [None, None], [False, False], [0.0, 0.0]
         if T:
@@ -448,7 +454,7 @@ class Bot:
                     full = w["charge"] >= w["stats"]["charge"] - 0.05
                     fire[i] = not (full and err < tol[i] and ok[i])
                 else:
-                    fire[i] = ok[i] and w["cooldown"] <= 0 and err < 0.35
+                    fire[i] = (ok[i] and err < 0.35 or precharge and t >= self.short_until) and w["cooldown"] <= 0
             elif k == "lightning":
                 fire[i] = ok[i] and w["cooldown"] <= 0.1 and abs(ang_diff(now[0], aims[i][0])) < tol[i]
             else:
@@ -549,6 +555,44 @@ class Bot:
             return True
         return any(s["kind"] in ("step", "boost", "jet") and s["dist"] == "near" for s in obs["sounds"])
 
+    def hidden(self, p, foes):
+        """Is a mech standing at p out of sight of all these foes (no line from their eyes to its middle or top)?"""
+        z = self.world.ground_at(p[0], p[1]) if self.world else 0.0
+        mid, top = [p[0], p[1], z + self.mech["height"] / 2], [p[0], p[1], z + self.mech["height"]]
+        return not any(self.los(e, mid) or self.los(e, top) for e in foes)
+
+    def hide_spot(self, pos, foes):
+        """Nearest walkable spot within COVER_NEAR m, walkable to in a straight line, out of sight of all foes."""
+        if not self.world:
+            return None
+        deadline = time.perf_counter() + 0.008  # line-of-sight checks are slow in Python: stop after 8 ms
+        for rad in (6.0, 12.0, 20.0, COVER_NEAR):
+            best = None
+            for k in range(16):
+                if time.perf_counter() > deadline:
+                    return best[1] if best else None
+                a = k * math.pi / 8
+                p = [pos[0] + math.cos(a) * rad, pos[1] + math.sin(a) * rad]
+                if self.world.free(*p) and self.world.line_free(pos, p) and self.hidden(p, foes):
+                    far = min(d2(p, e) for e in foes)  # of the hidden ones on this ring, the one farthest from them
+                    if best is None or far > best[0]:
+                        best = (far, p)
+            if best:
+                return best[1]
+        return None
+
+    def fall_back(self, me, pos, T, t):
+        """Losing a fight with cover near: the spot to hide at (kept while it hides us), else None."""
+        if not (T and T["kind"] == "mech" and T.get("losing") and me["in_zone"]):
+            self.hide = None
+            return None
+        foes = [[x["pos"][0], x["pos"][1], x["pos"][2] + self.mech["eye_height"]] for x in T["foes"]]
+        if self.hide and (t - self.hide[1] < 1.0 or self.hidden(self.hide[0], foes)):
+            return self.hide[0]
+        spot = self.hide_spot(pos, foes)
+        self.hide = (spot, t) if spot else None
+        return spot
+
     # ----- decision -----
     def act(self, obs: mf.Observation) -> mf.Action:
         me = obs["self"]
@@ -584,7 +628,10 @@ class Bot:
         enemies = [m for m in obs["mechs"] if m["kind"] == "mech"]
         near = min(enemies, key=lambda m: d2(m["pos"], pos), default=None)
         T = self.targets(obs, me, muzzle, hpf)  # no running off in the open: a laser hits a runner just the same
-        aim, fire, reload = self.weapons(me, muzzle, tube, T, t)
+        hide = self.fall_back(me, pos, T, t)  # losing with cover near: shoot from behind it
+        if T and T["kind"] == "mech" and T["los"]:
+            self.peek_from = list(pos[:2])  # a spot we see it from
+        aim, fire, reload = self.weapons(me, muzzle, tube, T, t, precharge=hide is not None and not T["los"])
         if self.turn_to and t - self.turn_to[1] < 1.0 and not (T and T["kind"] == "mech" and T["los"] and T["id"] in self.hit_by
                                                               and t - self.hit_by[T["id"]] < 1.0):
             aim = [self.turn_to[0], 0.0]  # hit in the back (x1.5) by someone we don't have in front of us: turn round now
@@ -599,6 +646,21 @@ class Bot:
             move, mode = dodge
         elif not me["in_zone"]:
             mode = "zone"
+        elif hide:
+            mode, goal, arrive = "cover", hide, 1.5
+            laser = next((w for w in me["weapons"] if w and w["kind"] == "laser"), None)
+            charged = laser is not None and laser.get("charge", 0) >= laser["stats"]["charge"] - 0.05
+            if t < self.peek_until:  # stepped out for a shot: back in once the laser has gone off
+                if laser is not None and self.peek_charged and not laser.get("charge", 0):
+                    self.peek_until = t
+                elif self.peek_from:
+                    goal, mode = self.peek_from, "peek"
+            elif d2(pos, hide) < 2.5 and not T["los"] and (charged or (laser is None and t >= self.next_peek)):
+                tp = [T["pos"][i] + T["vel"][i] * AMBUSH_S for i in range(3)]
+                coming = self.los([tp[0], tp[1], tp[2] + self.mech["eye_height"]], [x, y, z + self.mech["height"] / 2])
+                if not coming and self.peek_from:  # it isn't coming round the corner: step out to where we saw it from
+                    self.peek_until, self.next_peek, self.peek_charged = t + PEEK_S, t + PEEK_S + 2.5, charged
+                    goal, mode = self.peek_from, "peek"
         elif T and T["kind"] == "mech" and T.get("plan") in ("flank", "flank fire") and self.flank_spot(T, pos):
             mode, goal, arrive = T["plan"].split()[0], self.flank_spot(T, pos), 4.0
         elif T and T["kind"] == "mech" and T.get("plan") == "avoid":
