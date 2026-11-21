@@ -27,6 +27,14 @@ GUN_TOL = 1.0        # m: the gun fires only when its aim is this close to the l
 GUN_MIN_P = 0.15     # the gun holds fire below this estimated hit chance
 LASER_MARGIN = 0.8   # m: the beam must point this far inside the target's edge when we let go
 DEBUG = bool(__import__("os").environ.get("BOT_DEBUG"))
+# Evasion (each one switchable, for duel tests; all off until one beats the bot without it):
+DODGE_BULLETS = False  # sidestep gun bullets we can see coming that would hit us
+KEEP_RANGE = False     # with a laser against a mech without one, fight from KEEP_FAR m (its gun misses there)
+LASER_COVER = False    # an enemy laser charging at us: duck out of its line if cover is a few steps away
+JINK = False           # reverse the strafe when they fire (a led shot lands where we were going)
+WATCHED = False       # strafe whenever an enemy is aiming at us, not only when we have a shot at it
+KEEP_FAR, KEEP_NEAR = 170.0, 140.0  # m: back off below KEEP_NEAR, toward KEEP_FAR
+LIGHTNING_KEEP = 55.0  # m: outside a lightning arc's reach (45 m) when we hold none
 # Upgrade order, one entry per stack; with lightning in hand its two upgrades come right after laser_charge.
 UPGRADE_PLAN = ["plating", "laser_damage", "nanites", "plating", "laser_damage", "laser_charge", "plating", "armor",
                 "gun_damage", "gun_rate", "sensors", "armor", "gyros"]
@@ -142,6 +150,9 @@ class Bot:
         self.bad_pickups = {}            # id -> t until we stop trying it
         self.hit_by, self.hit_on = {}, {}  # id -> last time it damaged us / we damaged it
         self.dbg = {}
+        self.seen_bullets = {}           # enemy bullet id -> t first seen (JINK)
+        self.cover, self.cover_t = None, -1e9
+        self.flip_t = -1e9
         self.pred = Predictor(self.mech.get("gravity", 22), self.world.ground_at if self.world else None)
 
     # ----- memory -----
@@ -478,6 +489,128 @@ class Bot:
                     best, bd = p, d2(p, pos)
         return best
 
+    # ----- evasion -----
+    def bullet_dodge(self, obs, me, pos, c, r):
+        """A unit move that clears the enemy bullets heading into us, or None (nothing coming, or too late)."""
+        st = me["stats"]
+        R = st.get("radius", self.mech["radius"]) + self.cfg["projectile"].get("gun_radius", 0.3) + 0.8
+        H = st.get("height", self.mech["height"])
+        v0 = me["vel"]
+        threats = []
+        for p in obs["projectiles"]:
+            if p["kind"] not in ("gun", "npc"):
+                continue
+            pv = p["vel"]
+            rx, ry = pos[0] - p["pos"][0], pos[1] - p["pos"][1]
+            vx, vy = pv[0] - v0[0], pv[1] - v0[1]
+            vv = vx * vx + vy * vy
+            if vv < 1:
+                continue
+            tc = (rx * vx + ry * vy) / vv
+            if not 0.0 < tc < 1.5:
+                continue
+            zb = p["pos"][2] + pv[2] * tc
+            if not pos[2] - 0.5 <= zb <= pos[2] + H + 0.5:
+                continue
+            if math.hypot(rx - vx * tc, ry - vy * tc) < R:
+                threats.append((tc, p))
+        if not threats or min(tc for tc, _ in threats) < 0.12:
+            return None
+        acc, vmax = st.get("ground_accel", 58.5), st.get("boost_speed", 19.5)
+
+        def miss(d, tc, p):  # our centre vs the bullet at tc if we run toward d (after one tick of latency)
+            lat = 0.05
+            px, py = pos[0] + v0[0] * lat, pos[1] + v0[1] * lat
+            vx, vy, t = v0[0], v0[1], lat
+            while t < tc - 1e-9:
+                step = min(0.05, tc - t)
+                wx, wy = d[0] * vmax - vx, d[1] * vmax - vy
+                wl = math.hypot(wx, wy)
+                k = min(1.0, acc * step / wl) if wl > 1e-9 else 0.0
+                nvx, nvy = vx + wx * k, vy + wy * k
+                px, py = px + (vx + nvx) / 2 * step, py + (vy + nvy) / 2 * step
+                vx, vy, t = nvx, nvy, t + step
+            bx, by = p["pos"][0] + p["vel"][0] * tc, p["pos"][1] + p["vel"][1] * tc
+            return math.hypot(px - bx, py - by)
+        best, bscore = None, None
+        for k in range(16):
+            a = k * math.pi / 8
+            d = [math.cos(a), math.sin(a)]
+            ahead = [pos[0] + d[0] * 6, pos[1] + d[1] * 6]
+            if self.world and not self.world.line_free(pos, ahead):
+                continue
+            if d2(ahead, c) > r - 2:
+                continue
+            cleared = sum(miss(d, tc, p) >= R for tc, p in threats)
+            sc = (cleared, min(miss(d, tc, p) for tc, p in threats))
+            if bscore is None or sc > bscore:
+                best, bscore = d, sc
+        return best if best and bscore[0] > 0 else None
+
+    def laser_threat(self, obs, me, pos):
+        """An enemy whose laser is charging with its aim on us and a clear line to us, or None."""
+        H = me["stats"].get("height", self.mech["height"])
+        for m in obs["mechs"]:
+            if m["kind"] != "mech" or not m.get("charging"):
+                continue
+            b = math.atan2(pos[1] - m["pos"][1], pos[0] - m["pos"][0])
+            if abs(ang_diff(m["aim"][0], b)) > 0.25:
+                continue
+            eye = [m["pos"][0], m["pos"][1], m["pos"][2] + self.mech.get("muzzle_height", 7)]
+            if self.los(eye, [pos[0], pos[1], pos[2] + H / 2]):
+                return m
+        return None
+
+    def cover_from(self, m, me, pos, c, r):
+        """The nearest spot within a short boost that m's beam can't reach (behind a wall or a crest), or None."""
+        if not self.world:
+            return None
+        H = me["stats"].get("height", self.mech["height"])
+        eye = [m["pos"][0], m["pos"][1], m["pos"][2] + self.mech.get("muzzle_height", 7)]
+        base = math.atan2(pos[1] - m["pos"][1], pos[0] - m["pos"][0])
+        for dist in (4.0, 7.0, 10.0, 13.0):
+            for k in (2, -2, 3, -3, 1, -1, 4, -4, 0):  # sideways first: backing off keeps us in its line
+                a = base + k * math.pi / 8
+                q = [pos[0] + math.cos(a) * dist, pos[1] + math.sin(a) * dist]
+                if d2(q, c) > r - 3 or not self.world.line_free(pos, q):
+                    continue
+                g = self.world.ground_at(q[0], q[1], pos[2])
+                if abs(g - pos[2]) > 2.0:
+                    continue
+                if not self.los(eye, [q[0], q[1], g + H / 2]) and not self.los(eye, [q[0], q[1], g + H - 0.5]):
+                    return q
+        return None
+
+    def range_goal(self, me, pos, T, c, r):
+        """With a laser against a mech that has none: a spot KEEP_FAR from it (its gun misses there, our
+        beam doesn't). Without lightning against one that has it: outside its arc. Kept inside the zone."""
+        if not T or T["kind"] != "mech" or not T["los"]:
+            return None
+        mine = {w["kind"] for w in me["weapons"] if w}
+        theirs = set(T["m"].get("weapons", []))
+        d = d2(T["pos"], pos)
+        want = None
+        if "laser" in mine and "laser" not in theirs and d < KEEP_NEAR:
+            want = KEEP_FAR
+        elif "lightning" in theirs and "lightning" not in mine and d < LIGHTNING_KEEP:
+            want = LIGHTNING_KEEP + 10
+        if want is None:
+            return None
+        u = unit(pos[0] - T["pos"][0], pos[1] - T["pos"][1])
+        g = [T["pos"][0] + u[0] * want, T["pos"][1] + u[1] * want]
+        rr = max(r - EDGE_MARGIN, 0.0)
+        if d2(g, c) > rr:  # the zone is in the way: the farthest point from it on our side of the safe circle
+            best = None
+            for k in range(-12, 13):
+                a = math.atan2(pos[1] - c[1], pos[0] - c[0]) + k * math.pi / 12
+                q = [c[0] + math.cos(a) * rr, c[1] + math.sin(a) * rr]
+                if best is None or d2(q, T["pos"]) > d2(best, T["pos"]):
+                    best = q
+            g = best
+        if self.world:
+            g = self.world.clamp(g, MAP_MARGIN)
+        return g if d2(g, T["pos"]) > d + 5 else None
+
     # ----- decision -----
     def act(self, obs: mf.Observation) -> mf.Action:
         me = obs["self"]
@@ -552,13 +685,46 @@ class Bot:
             elif loot:
                 goal, mode, arrive = loot, "loot", 1.0
 
+        evade = None
+        if move is None and me["in_zone"]:
+            lt = self.laser_threat(obs, me, pos) if LASER_COVER else None
+            if lt is not None:
+                if self.cover is None or t - self.cover_t > 0.5:
+                    self.cover, self.cover_t = self.cover_from(lt, me, pos, c, r), t
+                if self.cover is not None:
+                    goal, mode, arrive = self.cover, "cover", 1.0
+            else:
+                self.cover = None
+            if mode == "edge" and KEEP_RANGE:
+                rg = self.range_goal(me, pos, T, c, r)
+                if rg:
+                    goal, mode = rg, "edge"  # still strafing, pulled back toward the range we want
+            if DODGE_BULLETS:
+                evade = self.bullet_dodge(obs, me, pos, c, r)
+                if evade:
+                    move, mode = evade, "dodge bullet"
+        if JINK:  # a new bullet coming our way, or a shot heard close: turn the strafe now
+            fresh = [p for p in obs["projectiles"] if p["kind"] == "gun" and p["id"] not in self.seen_bullets]
+            for p in obs["projectiles"]:
+                self.seen_bullets.setdefault(p["id"], t)
+            self.seen_bullets = {k: v for k, v in self.seen_bullets.items() if t - v < 3}
+            heard = any(snd["kind"] == "gun" and snd["dist"] != "far" and snd["age"] < 0.11 for snd in obs["sounds"])
+            if (fresh or heard) and t - self.flip_t > 0.25:
+                self.strafe_sign, self.strafe_until, self.flip_t = -self.strafe_sign, t + self.rng.uniform(0.35, 0.9), t
+
         gap = d2(goal, pos)
         if move is None:
             move = self.steer(pos, goal, t, force=self.stuck_since is not None and t - self.stuck_since > 1) if gap > arrive else [0.0, 0.0]
-            if mode == "edge" and T and T["kind"] == "mech" and T["los"]:  # strafe across their line of fire
+            foe = T["pos"] if (T and T["kind"] == "mech" and T["los"]) else None
+            if WATCHED and foe is None:  # someone aiming at us that we can't shoot back yet: don't stand still for it
+                w_ = next((m for m in enemies if abs(ang_diff(m["aim"][0], math.atan2(y - m["pos"][1], x - m["pos"][0]))) < 0.3
+                           and d2(m["pos"], pos) < 230), None)
+                foe = w_["pos"] if w_ else None
+            if mode == "edge" and foe is not None:  # strafe across their line of fire
                 if t >= self.strafe_until:
                     self.strafe_sign, self.strafe_until = -self.strafe_sign, t + self.rng.uniform(0.35, 0.9)  # reverse before their led shot lands
-                yaw = math.atan2(T["pos"][1] - y, T["pos"][0] - x) + self.strafe_sign * math.pi / 2
+                    self.flip_t = t
+                yaw = math.atan2(foe[1] - y, foe[0] - x) + self.strafe_sign * math.pi / 2
                 pull = min(gap / 6, 1.0)
                 to_spot = unit(goal[0] - x, goal[1] - y)
                 move = unit(math.cos(yaw) + to_spot[0] * pull, math.sin(yaw) + to_spot[1] * pull)
@@ -580,7 +746,7 @@ class Bot:
                 a = math.atan2(move[1], move[0]) + self.rng.choice((-1, 1)) * math.pi / 2
                 self.unstick_dir, self.unstick_until = [math.cos(a), math.sin(a)], t + 1.0
                 self.stuck_since, self.path = None, []
-        boost = mode in ("dodge shell", "zone") or (stuck and not fighting) or (
+        boost = mode in ("dodge shell", "zone", "dodge bullet", "cover") or (stuck and not fighting) or (
             gap > 40 and me["energy"] > 60 and not T)
         if fighting:  # boost through the whole fight, walking just long enough to recharge (duel-tested; jets lost)
             self.burn = me["energy"] > 70 if not self.burn else me["energy"] > 25
@@ -601,6 +767,8 @@ class Bot:
                 aim = [inward, 0.0]  # back to the zone edge: enemies come from inside
 
         act.update(move=move, boost=boost, jump=jump, aim=aim, fire=fire, reload=reload)
+        if DEBUG:
+            self.dbg["mode " + mode] = self.dbg.get("mode " + mode, 0) + 1
         if DEBUG and obs["tick"] % 200 == 0 and self.dbg:
             mf.log("gun", sorted(self.dbg.items()))
         self.draw(pos, muzzle, goal, T, mode, me)

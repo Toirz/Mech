@@ -127,6 +127,63 @@ def play(job):
     return res
 
 
+def play_ffa(job):
+    """One free-for-all: half the mechs are the candidate, half the opponent; `swapped` trades the halves."""
+    oi, rnd, swapped, cand_dir, opp_dir = job
+    a = G["args"]
+    n = a.ffa
+    rng = random.Random(a.seed * 1000003 + rnd)
+    spawns, zone = sim.ffa_setup(G["arena"], rng, n)
+    kinds = [sorted(LOADOUTS)[rng.randrange(len(LOADOUTS))] if a.loadout == "mixed" else a.loadout for _ in range(n)]
+    side = [(i % 2 == 0) != swapped for i in range(n)]  # True = candidate
+    bots = [(["python3", "-u", "example_bot.py"], cand_dir if c else opp_dir) for c in side]
+    m = sim.Match(G["arena"], G["map_dir"], G["cfg"], bots, spawns, [LOADOUTS[k] for k in kinds], zone, seed=rng.randrange(1 << 30),
+                  max_t=a.max_t, timeout=a.timeout)
+    res = m.run()
+    pts = [n - p for p in res["places"]]
+    res.update(opp=oi, round=rnd, swapped=swapped, side=side,
+               cand=sum(p for p, c in zip(pts, side) if c) / sum(side), base=sum(p for p, c in zip(pts, side) if not c) / (n - sum(side)))
+    return res
+
+
+def ffa_report(a, results, cand_label, opps):
+    verdict, vp = None, None
+    for oi, (label, _) in enumerate(opps):
+        rs = [r for r in results if r["opp"] == oi]
+        diffs = {}
+        for r in rs:
+            diffs.setdefault(r["round"], []).append(r["cand"] - r["base"])
+        per_round = [sum(v) / len(v) for v in diffs.values()]
+        mean = sum(per_round) / len(per_round)
+        sd = (sum((x - mean) ** 2 for x in per_round) / max(len(per_round) - 1, 1)) ** 0.5
+        se = sd / len(per_round) ** 0.5
+        w, l = sum(x > 0 for x in per_round), sum(x < 0 for x in per_round)
+        p = sign_p(w, l)
+        cpts = sum(r["cand"] for r in rs) / len(rs)
+        bpts = sum(r["base"] for r in rs) / len(rs)
+        print(f"\n=== FFA of {a.ffa} ({a.ffa // 2} {cand_label} vs {a.ffa - a.ffa // 2} {label}), {len(rs)} games: "
+              f"points per mech {cand_label} {cpts:.2f} vs {label} {bpts:.2f} (max {a.ffa - 1}); "
+              f"difference {mean:+.2f} +- {se:.2f}; rounds won {w}-{l} (sign test p = {p:.3f})")
+        for c, name in ((True, cand_label), (False, label)):
+            tk, n = {}, 0
+            for r in rs:
+                for i, isc in enumerate(r["side"]):
+                    if isc == c:
+                        n += 1
+                        for k, v in r["stats"][i].get("taken", {}).items():
+                            tk[k] = tk.get(k, 0.0) + v
+            print(f"  damage taken per mech per game {name:>10}: " + ", ".join(f"{k} {v / n:.0f}" for k, v in sorted(tk.items(), key=lambda x: -x[1]))
+                  + f"  (total {sum(tk.values()) / n:.0f})")
+        if oi == 0:
+            verdict = "KEEP" if w > l and p < a.alpha else "REJECT" if l > w and p < a.alpha else "UNSURE"
+            vp = (p, label)
+    p, label = vp
+    why = {"KEEP": f"better than {label} (p = {p:.3f} < {a.alpha})", "REJECT": f"worse than {label} (p = {p:.3f} < {a.alpha})",
+           "UNSURE": f"no clear difference from {label} yet (p = {p:.3f}): run more rounds"}[verdict]
+    print(f"\nverdict: {verdict}: {cand_label} is {why}")
+    return {"KEEP": 0, "REJECT": 1, "UNSURE": 2}[verdict]
+
+
 # ------------------------------------------------------------------ report
 def sign_p(w, l):
     """Two-sided exact sign test p-value for w wins vs l losses (draws dropped)."""
@@ -173,6 +230,8 @@ def main():
     ap.add_argument("--alpha", type=float, default=0.1, help="sign-test p-value for KEEP / REJECT")
     ap.add_argument("--logs", help="folder for each game's bot stderr")
     ap.add_argument("--json", help="write every game's result here")
+    ap.add_argument("--ffa", type=int, default=0, help="free-for-all of this many mechs (half candidate, half the first opponent), "
+                    "scored like the server: N - place per mech")
     a = ap.parse_args()
     if len(a.bots) < 2:
         ap.error("give a candidate and at least one opponent")
@@ -192,6 +251,19 @@ def main():
     results = []
     t0 = time.time()
     ctx = mp.get_context("fork")
+    if a.ffa:
+        a.max_t = max(a.max_t, 260.0)
+        jobs = [(0, r, sw, cand_dir, opps[0][1]) for r in range(a.rounds) for sw in (False, True)]
+        with ctx.Pool(a.jobs, initializer=init_worker, initargs=(arena, map_dir, cfg, a)) as pool:
+            for i, res in enumerate(pool.imap_unordered(play_ffa, jobs), 1):
+                results.append(res)
+                print(f"\r{i}/{len(jobs)} games ({time.time() - t0:.0f} s) last: points {res['cand']:.1f} vs {res['base']:.1f} at {res['t']:.0f}s   ",
+                      end="", flush=True)
+        print()
+        if a.json:
+            with open(a.json, "w") as f:
+                json.dump(results, f)
+        return ffa_report(a, results, cand_label, opps[:1])
     with ctx.Pool(a.jobs, initializer=init_worker, initargs=(arena, map_dir, cfg, a)) as pool:
         for i, res in enumerate(pool.imap_unordered(play, jobs), 1):
             results.append(res)
@@ -216,6 +288,13 @@ def main():
         tos = sum(r["timeout"] for r in rs)
         print(f"\n=== {cand_label} vs {label}: {w} W  {l} L  {d} D  -> {100 * rate:.0f}% (sign test p = {p:.3f}); "
               f"rounds {rounds_won}-{rounds_lost}; {tos} went to time; late answers {late[0]} / {late[1]}")
+        for side, name in ((0, cand_label), (1, label)):
+            tk = {}
+            for r in rs:
+                for k, v in r["stats"][side].get("taken", {}).items():
+                    tk[k] = tk.get(k, 0.0) + v
+            print(f"  damage taken per game {name:>10}: " + ", ".join(f"{k} {v / len(rs):.0f}" for k, v in sorted(tk.items(), key=lambda x: -x[1]))
+                  + f"  (total {sum(tk.values()) / len(rs):.0f})")
         for side, name in ((0, cand_label), (1, label)):
             print(f"  hit rate {name:>10}   " + "  ".join(f"{('<' + str(b)) if b < 1e9 else '200+':>12}" for b in sim.RANGE_BUCKETS) + "         all")
             for kind, (row, tot) in hit_table(rs, side).items():

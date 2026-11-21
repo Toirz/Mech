@@ -272,7 +272,7 @@ class Mech:
         self.aim, self.cmd_aim = [yaw, 0.0], [yaw, 0.0]
         self.hp = self.max_hp = mc["hp"]
         self.energy = self.max_energy = mc["energy"]
-        self.grounded, self.alive = True, True
+        self.grounded, self.alive, self.died = True, True, None
         self.weapons = [self.weapon(k) for k in loadout]
         self.move, self.boost, self.fire, self.jump = [0.0, 0.0], False, [False, False], False
         self.last_spend, self.last_fight = -1e9, -1e9
@@ -310,7 +310,7 @@ class Match:
         self.next_id = {"proj": 1, "pick": 8000}
         self.stats = [{"shots": {}, "hits": {}, "dmg": {}, "late": 0} for _ in self.mechs]
         self.procs = [BotProc(cmd, cwd, os.path.join(log_dir, f"bot{i}.log") if log_dir else None) for i, (cmd, cwd) in enumerate(bots)]
-        self.names = ["?", "?"]
+        self.names = ["?"] * len(self.mechs)
 
     # ----- zone -----
     def zone(self):
@@ -360,6 +360,8 @@ class Match:
         tgt.events.append(ev)
         if effect:
             tgt.events.append({"type": "effect", "effect": effect, "by": by.id})
+        tk = self.stats[tgt.id].setdefault("taken", {})
+        tk[weapon] = tk.get(weapon, 0.0) + amt
         if by is not tgt:
             by.last_fight = self.t
             hit = {"type": "hit", "target": tgt.id, "amount": round(amt, 1), "weapon": weapon}
@@ -372,14 +374,18 @@ class Match:
                 s = self.stats[by.id]
                 s["dmg"][weapon] = s["dmg"].get(weapon, 0.0) + amt
         if tgt.hp <= 0:
-            tgt.hp, tgt.alive = 0.0, False
+            tgt.hp, tgt.alive, tgt.died = 0.0, False, self.tick
             if by is not tgt:
                 by.events.append({"type": "kill", "target": tgt.id})
             self.emit("death", tgt.pos, tgt)
         return amt
 
+    def nearest_foe(self, m):
+        foes = [x for x in self.mechs if x is not m and x.alive] or [x for x in self.mechs if x is not m]
+        return min(foes, key=lambda x: math.dist(m.pos, x.pos))
+
     def count_shot(self, m, kind, hit):
-        foe = self.mechs[1 - m.id]
+        foe = self.nearest_foe(m)
         b = bucket(math.dist(m.pos, foe.pos))
         s = self.stats[m.id]
         s["shots"].setdefault(kind, {}).setdefault(b, 0)
@@ -438,7 +444,7 @@ class Match:
                     sp = math.radians(st["spread_deg"])
                     d = direction(m.aim[0] + self.rng.gauss(0, sp), m.aim[1] + self.rng.gauss(0, sp))
                     o = self.shot_origin(m, mh, d)
-                    foe = self.mechs[1 - m.id]
+                    foe = self.nearest_foe(m)
                     self.projectiles.append({"id": self.next_id["proj"], "kind": "gun", "by": m, "pos": o,
                                              "vel": [d[j] * st["speed"] for j in range(3)], "left": st["range"], "dmg": st["damage"],
                                              "bucket": bucket(math.dist(m.pos, foe.pos)), "hit": False})
@@ -450,7 +456,7 @@ class Match:
                 if held and w["cooldown"] <= 0 and w["equip"] <= 0:
                     d = direction(*m.aim)
                     o = self.shot_origin(m, m.mc["height"] + 0.5, d)
-                    foe = self.mechs[1 - m.id]
+                    foe = self.nearest_foe(m)
                     self.projectiles.append({"id": self.next_id["proj"], "kind": "mortar", "by": m, "pos": o,
                                              "vel": [d[j] * st["speed"] for j in range(3)], "ttl": st["ttl"], "st": st,
                                              "bucket": bucket(math.dist(m.pos, foe.pos)), "hit": False})
@@ -484,6 +490,21 @@ class Match:
                                     lw["charge"] = 0.0
                         self.damage(x, st["damage"], "lightning", mz, m, eff)
                         path = [mz, best[2]]
+                        hit_ids, cur, dmg = {x.id}, best[2], st["damage"]
+                        for _ in range(int(st.get("chain", 0))):  # jumps to the nearest other target in chain_range
+                            dmg *= st.get("chain_falloff", 0.7)
+                            nxt = min(((math.dist(cur, [y.pos[0], y.pos[1], y.pos[2] + y.mc["height"] / 2]), y) for y in self.mechs
+                                       if y.alive and y is not m and y.id not in hit_ids), default=None, key=lambda e: e[0])
+                            if nxt is None or nxt[0] > st.get("chain_range", 14):
+                                break
+                            y = nxt[1]
+                            yc = [y.pos[0], y.pos[1], y.pos[2] + y.mc["height"] / 2]
+                            if self.A.seg_block(cur, yc, 0.5) is not None:
+                                break
+                            self.damage(y, dmg, "lightning", cur, m)
+                            hit_ids.add(y.id)
+                            path.append(yc)
+                            cur = yc
                     else:
                         d = direction(m.aim[0], m.aim[1])
                         o, end, _ = self.hitscan(m, d, st["range"], mh)
@@ -709,9 +730,12 @@ class Match:
         m.aim[1] += max(-pr, min(pr, want_p - m.aim[1]))
 
     def push_apart(self):
-        a, b = self.mechs
-        if not (a.alive and b.alive):
-            return
+        live = [m for m in self.mechs if m.alive]
+        for i in range(len(live)):
+            for j in range(i + 1, len(live)):
+                self._push(live[i], live[j])
+
+    def _push(self, a, b):
         dx, dy = b.pos[0] - a.pos[0], b.pos[1] - a.pos[1]
         d = math.hypot(dx, dy)
         rr = a.mc["radius"] + b.mc["radius"]
@@ -731,10 +755,12 @@ class Match:
         if not m.in_zone:
             m.hp -= dps * DT
             m.last_fight = self.t
+            tk = self.stats[m.id].setdefault("taken", {})
+            tk["zone"] = tk.get("zone", 0.0) + dps * DT
             if not m.events or m.events[-1].get("weapon") != "zone":
                 m.events.append({"type": "damaged", "amount": round(dps * DT, 1), "weapon": "zone", "bearing": None, "by": None})
             if m.hp <= 0:
-                m.hp, m.alive = 0.0, False
+                m.hp, m.alive, m.died = 0.0, False, self.tick
                 self.emit("death", m.pos, m)
                 return
         elif self.t - m.last_fight >= mc["regen_delay"]:
@@ -872,6 +898,17 @@ class Match:
         m.weapons[slot] = None
         m.events.append({"type": "dropped", "id": pid, "kind": w["kind"], "slot": slot})
 
+    def places(self):
+        """Placement per mech (protocol.md §4): death order, same-tick deaths share; at the clock, survivors by HP."""
+        alive = sorted((m for m in self.mechs if m.alive), key=lambda m: -m.hp / m.max_hp)
+        out = {}
+        for k, m in enumerate(alive):
+            out[m.id] = 1 + sum(1 for x in alive[:k] if x.hp / x.max_hp > m.hp / m.max_hp + 1e-9)
+        for m in self.mechs:
+            if not m.alive:
+                out[m.id] = 1 + len(alive) + sum(1 for x in self.mechs if not x.alive and x.died > m.died)
+        return [out[m.id] for m in self.mechs]
+
     # ----- run -----
     def run(self):
         hz = self.cfg["match"]["tick_hz"]
@@ -913,11 +950,13 @@ class Match:
                 self.tick += 1
                 self.t = self.tick / hz
         finally:
-            alive = [m for m in self.mechs if m.alive]
+            places = self.places()
             for i, p in enumerate(self.procs):
-                m = self.mechs[i]
-                p.send({"type": "end", "place": 1 if (m.alive and len(alive) == 1) else 2, "kills": 0})
+                p.send({"type": "end", "place": places[i], "kills": 0})
                 p.close()
+        if len(self.mechs) > 2:
+            return {"places": places, "t": round(self.t, 1), "hp": [round(m.hp) for m in self.mechs], "stats": self.stats,
+                    "names": self.names, "timeout": self.t >= self.max_t}
         a, b = self.mechs
         if a.alive and not b.alive:
             win = 0
@@ -977,3 +1016,51 @@ def duel_setup(arena, rng, dmin=90.0, dmax=170.0, max_t=180.0):
             {"hold_s": 10, "shrink_s": 25, "radius": 0, "dps": 160, "center": c2}]}
         return pts, zone
     raise RuntimeError("no duel spawn found")
+
+
+def ffa_setup(arena, rng, n, sep=90.0):
+    """n spawns on open ground at least `sep` m apart inside a circle, and a zone that closes on them over ~3 min."""
+    A = arena
+    for _ in range(200):
+        R0 = 60 + 40 * math.sqrt(n)
+        cx = rng.uniform(A.minx + R0 * 0.6, A.maxx - R0 * 0.6)
+        cy = rng.uniform(A.miny + R0 * 0.6, A.maxy - R0 * 0.6)
+        pts = []
+        for _ in range(4000):
+            if len(pts) == n:
+                break
+            a, d = rng.uniform(-math.pi, math.pi), R0 * 0.85 * math.sqrt(rng.random())
+            x, y = cx + math.cos(a) * d, cy + math.sin(a) * d
+            if not (A.minx + 20 < x < A.maxx - 20 and A.miny + 20 < y < A.maxy - 20):
+                continue
+            if any(math.hypot(x - p[0], y - p[1]) < sep for p in pts):
+                continue
+            g = A.ground(x, y)
+            ok = True
+            for k in range(17):
+                aa = k * math.pi / 8
+                rr = 0 if k == 0 else (3 if k < 9 else 6)
+                px, py = x + math.cos(aa) * rr, y + math.sin(aa) * rr
+                i = A.idx(px, py)
+                if i < 0 or A.lo[i] < g + 12 or abs(A.ground(px, py) - g) > 1.0:
+                    ok = False
+                    break
+            if ok:
+                pts.append([x, y, g, rng.uniform(-math.pi, math.pi)])
+        if len(pts) < n:
+            continue
+
+        def inner(c, r, rn):
+            a, d = rng.uniform(-math.pi, math.pi), rng.uniform(0, max(r - rn, 0) * 0.6)
+            return [c[0] + math.cos(a) * d, c[1] + math.sin(a) * d]
+        c0 = [cx, cy]
+        c1 = inner(c0, R0, R0 * 0.6)
+        c2 = inner(c1, R0 * 0.6, R0 * 0.3)
+        c3 = inner(c2, R0 * 0.3, R0 * 0.1)
+        zone = {"center": c0, "radius": R0, "phases": [
+            {"hold_s": 30, "shrink_s": 35, "radius": R0 * 0.6, "dps": 20, "center": c1},
+            {"hold_s": 25, "shrink_s": 30, "radius": R0 * 0.3, "dps": 35, "center": c2},
+            {"hold_s": 20, "shrink_s": 25, "radius": R0 * 0.1, "dps": 60, "center": c3},
+            {"hold_s": 15, "shrink_s": 20, "radius": 0, "dps": 160, "center": c3}]}
+        return pts, zone
+    raise RuntimeError("no ffa spawns found")
