@@ -324,11 +324,15 @@ class World:
         return True
 
 
-class PathJob:
-    """Weighted A* on the nav grid that can be run a little each decision (run() with a deadline)."""
+OUT_COST = 40.0    # nav cost per cell outside `keep` (the zone): a path leaves it only when there is no other way
 
-    def __init__(self, world: World, start, goal, weight=1.5, max_expand=60000):
-        self.w, self.weight, self.left = world, weight, max_expand
+
+class PathJob:
+    """Weighted A* on the nav grid that can be run a little each decision (run() with a deadline). With
+    keep = (cx, cy, r), cells outside that circle cost OUT_COST more: the path stays inside the zone if it can."""
+
+    def __init__(self, world: World, start, goal, weight=1.5, max_expand=60000, keep=None):
+        self.w, self.weight, self.left, self.keep = world, weight, max_expand, keep
         self.goal_xy = (goal[0], goal[1])
         self.path, self.done = None, False
         s = world.snap(start[0], start[1], 6)
@@ -355,6 +359,11 @@ class PathJob:
         w = self.w
         NX, NY, floor, blocked, nearwall = w.NX, w.NY, w.floor, w.blocked, w.nearwall
         best, parent, open_, g_cell, up = self.best, self.parent, self.open, self.g, w.step_up
+        keep = self.keep
+        if keep is not None:  # the circle in cell units: cell (I, J) has its centre at x0 + (2 I + 0.5) step
+            kx = ((keep[0] - w.x0) * w.inv - 0.5) / NAV
+            ky = ((keep[1] - w.y0) * w.inv - 0.5) / NAV
+            kr2 = (max(keep[2], 0.0) * w.inv / NAV) ** 2
         n = 0
         while open_:
             n += 1
@@ -388,6 +397,8 @@ class PathJob:
                     cost += JUMP_COST
                 elif rise < -DROP_H:
                     cost += DROP_COST
+                if keep is not None and (I2 - kx) ** 2 + (J2 - ky) ** 2 > kr2:
+                    cost += OUT_COST
                 g2 = gc + cost
                 if g2 < best.get(D, 1e18):
                     best[D] = g2
@@ -410,6 +421,8 @@ class PathJob:
                         continue
                     if floor[D] < fc - CLIMB:
                         g2 = gc + k * dist + DROP_COST
+                        if keep is not None and (I2 - kx) ** 2 + (J2 - ky) ** 2 > kr2:
+                            g2 += OUT_COST
                         if g2 < best.get(D, 1e18):
                             best[D] = g2
                             parent[D] = C

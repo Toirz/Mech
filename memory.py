@@ -246,4 +246,5 @@ class Memory:
         return sum(d[4] for d in self.damage if t - d[0] <= within)
 
     def ghosts_near(self, p, r, t):
-        return [g for g in self.ghosts if math.hypot(g.x - p[0], g.y - p[1]) < r + 0.5 * g.radius(t, self.walk)]
+        """Guesses within r of p, counting half their spread (capped: an old guess is everywhere and nowhere)."""
+        return [g for g in self.ghosts if math.hypot(g.x - p[0], g.y - p[1]) < r + 0.5 * min(g.radius(t, self.walk), 60.0)]

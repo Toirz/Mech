@@ -1,3 +1,4 @@
+import math
 import random
 import time
 
@@ -51,6 +52,17 @@ def test_goal_on_a_roof_ends_next_to_the_building_or_fails(tmp_path):
     assert path and w.floor_at(*path[-1]) < 1.0
     path = solve(w, (40, 0), (-50, 0))  # from the roof down: dropping off is allowed
     assert path and w.floor_at(*path[-1]) < 1.0
+
+
+def test_paths_go_round_a_building_on_the_side_inside_the_zone(tmp_path):
+    w = W.World(make_map(str(tmp_path), 200, [("building", 0.0, 20.0, box(-10, -30, 10, 30))]), MECH)
+    free = solve(w, (-40, 5), (40, 5))
+    job = W.PathJob(w, (-40, 5), (40, 5), keep=(0, -60, 80))  # the zone lies to the south
+    while not job.run(time.perf_counter() + 1.0):
+        pass
+    assert job.path and min(p[1] for p in job.path) < -30          # round the south end
+    assert all(math.hypot(p[0], p[1] + 60) <= 80 for p in job.path)  # never out of the zone
+    assert free  # and without a zone it still finds its way
 
 
 def test_standing_points_are_inside_the_map(tmp_path):

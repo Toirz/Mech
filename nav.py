@@ -29,9 +29,10 @@ class Legs:
 
     # ---------- walking ----------
 
-    def toward(self, me, goal, t, deadline, arrive=3.0, climb=False):
+    def toward(self, me, goal, t, deadline, arrive=3.0, climb=False, keep=None):
         """Move vector toward goal (x, y) along the nav path; (0, 0) within `arrive` m. With `climb` (no walkable
-        way, e.g. the zone closes on a roof) it heads straight there and unstick() jets up the wall in the way."""
+        way, e.g. the zone closes on a roof) it heads straight there and unstick() jets up the wall in the way.
+        `keep` (cx, cy, r): new paths stay inside that circle (the zone) where they can."""
         x, y = me["pos"][0], me["pos"][1]
         self.climb_to = self.w.floor_at(goal[0], goal[1]) if climb and self.w is not None else None
         if math.hypot(goal[0] - x, goal[1] - y) < arrive:
@@ -41,7 +42,7 @@ class Legs:
             return unit(goal[0] - x, goal[1] - y)
         moved = self.goal is None or math.hypot(goal[0] - self.goal[0], goal[1] - self.goal[1]) > REPLAN_MOVE
         if moved or (self.job is None and (not self.path or t - self.t_plan > REPLAN_S)):
-            self.job, self.goal, self.t_plan = PathJob(self.w, (x, y), goal), (goal[0], goal[1]), t
+            self.job, self.goal, self.t_plan = PathJob(self.w, (x, y), goal, keep=keep), (goal[0], goal[1]), t
         if self.job is not None and self.job.run(deadline):
             self.path, self.job, self.t_plan = list(self.job.path or []), None, t
         while self.path and math.hypot(self.path[0][0] - x, self.path[0][1] - y) < WAYPOINT_R:
