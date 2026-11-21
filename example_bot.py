@@ -7,8 +7,11 @@ This file is the frame: the per-decision clock, the log line, and the wiring. Th
 import math
 import sys
 import time
+import traceback
 
 import mechfight as mf
+from memory import Memory
+from world import World
 
 NAME = "scratch"
 TICK_CAP = 0.025  # s we allow ourselves per decision (the server's budget is 50 ms)
@@ -35,10 +38,19 @@ class Bot:
     name = NAME
 
     def __init__(self, hello):
+        t0 = time.perf_counter()
         self.cfg = hello["config"]
+        try:
+            self.world = World(hello["map"]["dir"], self.cfg["mech"])
+        except Exception:  # no map: play on without walls (straight walks, every line of fire taken as clear)
+            log(traceback.format_exc())
+            self.world = None
+        self.mem = Memory(self.cfg, self.world)
+        log(f"hello: world {'ok' if self.world else 'MISSING'} in {time.perf_counter() - t0:.2f} s")
 
     def act(self, obs):
         clock = Clock(TICK_CAP)
+        self.mem.update(obs)
         me = obs["self"]
         x, y = me["pos"][0], me["pos"][1]
         c = obs["zone"]["next_center"]
