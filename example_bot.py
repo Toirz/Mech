@@ -146,6 +146,7 @@ class Bot:
         self.bad_pickups = {}            # id -> t until we stop trying it
         self.hit_by, self.hit_on = {}, {}  # id -> last time it damaged us / we damaged it
         self.foes = {}                   # mech id -> (pos, t) last seen
+        self.shot_t = {}                 # mech id -> last time we fired at it
         self.dbg = {}
         self.pred = Predictor(self.mech.get("gravity", 22), self.world.ground_at if self.world else None)
 
@@ -528,6 +529,11 @@ class Bot:
         near = min(enemies, key=lambda m: d2(m["pos"], pos), default=None)
         T = self.targets(obs, me, muzzle, hpf)  # no running off in the open: a laser hits a runner just the same
         aim, fire, reload = self.weapons(me, muzzle, tube, T, t)
+        if T and T["kind"] == "mech" and any(fire):
+            self.shot_t[T["id"]] = t
+        # In a fight: it's in sight and one of us shot at the other in the last 3 s (not just a mech far off in view).
+        engaged = bool(T and T["kind"] == "mech" and T["los"] and t - max(
+            self.hit_by.get(T["id"], -1e9), self.hit_on.get(T["id"], -1e9), self.shot_t.get(T["id"], -1e9)) < 3)
         if self.turn_to and t - self.turn_to[1] < 1.0 and not (T and T["kind"] == "mech" and T["los"] and T["id"] in self.hit_by
                                                               and t - self.hit_by[T["id"]] < 1.0):
             aim = [self.turn_to[0], 0.0]  # hit by someone we can't see (or in the back, x1.5): turn to it now
@@ -543,7 +549,7 @@ class Bot:
             move, mode = dodge
         elif not me["in_zone"]:
             mode = "zone"
-        else:
+        elif not engaged:  # in a fight, loot and drops wait: hold the edge spot and strafe (walking straight gets us led)
             drop = None
             calm = hpf >= DROP_HP and (self.threat is None or t - self.threat[1] > DROP_CALM_S)
             for dr in obs.get("drops", []) if calm else ():
@@ -579,7 +585,7 @@ class Bot:
 
         # Stuck: commanded to move but not getting anywhere -> jump and jet; if that fails too, sidestep.
         # Not while fighting inside the zone (hopping about loses the fight); outside it the zone kills faster than they do.
-        fighting = bool(T and T["kind"] == "mech" and T["los"] and me["in_zone"])
+        fighting = engaged and me["in_zone"]  # boost only in a real fight: a mech merely in view isn't worth the energy and noise
         wants_move = math.hypot(*move) > 0.5
         self.hist = [h for h in self.hist if t - h[0] < 1.2] + [(t, x, y, wants_move)]
         h0 = self.hist[0]
