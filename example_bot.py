@@ -21,7 +21,7 @@ MECH_SOUNDS = {"gun", "mortar", "laser", "laser_charge", "lightning", "step", "b
 WEAPON_VALUE = {"laser": 1.0, "lightning": 0.7, "gun": 0.5}  # never a mortar: a laser hit on its carrier cooks off (+60%)
 EARLY_S, EARLY_RANGE = 60.0, 250.0  # the first minute: walk this far for a laser (else a lightning)
 GUN_OPEN = 100.0     # m: the gun doesn't start a fight with a mech farther than this (it joins one at any range)
-SCAN_EVERY, SCAN_S = 8.0, 1.6  # s: standing at the edge, a full look around this often (turn_rate 4 rad/s: 1.6 s)
+SWEEP, SWEEP_S = 1.0, 6.0  # at the edge, look this far (rad) to either side of inward, one sweep each way per SWEEP_S s
 QUIET_MOVE, QUIET_NEAR = 0.42, 60.0  # under 5 m/s (|move| 0.42 of 11.7) makes no step sound; walk so near enemies
 # Upgrade order, one entry per stack; with lightning in hand its two upgrades come right after laser_charge.
 UPGRADE_PLAN = ["plating", "laser_damage", "nanites", "plating", "laser_damage", "laser_charge", "plating", "armor",
@@ -138,7 +138,6 @@ class Bot:
         self.bad_pickups = {}            # id -> t until we stop trying it
         self.hit_by, self.hit_on = {}, {}  # id -> last time it damaged us / we damaged it
         self.foes = {}                   # mech id -> (pos, t) last seen, kept 30 s
-        self.scan_t, self.scan_until = 0.0, -1.0
 
     # ----- memory -----
     def remember(self, obs, t, pos):
@@ -536,10 +535,8 @@ class Bot:
                 aim = [self.heard[0], 0.0]
             elif gap > 30 and wants_move:
                 aim = [math.atan2(move[1], move[0]), 0.0]
-            else:  # at the edge: watch inward (enemies come from inside), look all round now and then
-                if t >= self.scan_t:
-                    self.scan_t, self.scan_until = t + SCAN_EVERY, t + SCAN_S
-                aim = [me["aim"][0] + 1.0, 0.0] if t < self.scan_until else [inward, 0.0]
+            else:  # at the edge, the zone at our back: sweep the front (a 120-degree view +- 1 rad sees ~230 degrees)
+                aim = [inward + SWEEP * math.sin(2 * math.pi * t / SWEEP_S), 0.0]
 
         act.update(move=move, boost=boost, jump=jump, aim=aim, fire=fire, reload=reload)
         self.draw(pos, muzzle, goal, T, mode, me)
