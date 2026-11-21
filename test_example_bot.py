@@ -3,7 +3,7 @@ import math
 import os
 import random
 
-from example_bot import edge_spot, lead, mortar_aim, shell_landing, zone_at
+from example_bot import Bot, edge_spot, lead, mortar_aim, shell_landing, zone_at
 
 zone = {"center": [0, 0], "radius": 500, "next_center": [100, 0], "next_radius": 300, "shrink_start": 60, "shrink_end": 110}
 assert zone_at(zone, 0) == ([0, 0], 500)
@@ -55,8 +55,16 @@ if os.path.isdir(arena):
             assert path and all(math.dist(p, q) < 9 for p, q in zip([a] + path, path)), "path steps are neighbor cells"
             reached += math.dist(path[-1], b) < 1
     assert reached > 0
+    # Roof loot: an item on a 5-45 m roof counts as on a roof, and its launch spot is walkable ground near it.
+    rb = Bot.__new__(Bot)
+    rb.world = w
+    roofs = [i for i in range(len(w.hi)) if 5 < w.hi[i] - w.ground[i] < 45 and not w.free(w.x0 + (i % w.nx + 0.5) * 2, w.y0 + (i // w.nx + 0.5) * 2)]
+    i = roofs[len(roofs) // 2]
+    item = [w.x0 + (i % w.nx + 0.5) * 2, w.y0 + (i // w.nx + 0.5) * 2, w.hi[i]]
+    assert rb.on_roof(item) and not rb.on_roof([item[0], item[1], w.ground[i]])
+    ls = rb.launch_spot(item)
+    assert ls and w.free(*ls) and math.dist(ls, item[:2]) < 32, ls
 # Roaming heads for cells we haven't been to, inside the safe circle; hiding without a map stays put.
-from example_bot import Bot
 b = Bot.__new__(Bot)
 b.rng, b.world, b.visited, b.roam, b.roam_t = random.Random(2), None, {}, None, -1e9
 b.threat, b.cover, b.cover_t, b.mech = None, None, -1e9, {"height": 9}

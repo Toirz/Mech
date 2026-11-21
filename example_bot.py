@@ -1,8 +1,9 @@
 """Bot: roam the safe circle hunting lasers, cubes and supply drops; hide to heal when hurt; fight with the right weapon.
 
 Priorities each decision (movement): dodge a shell > get back in the zone > capture a supply drop
-> hide out of sight while HP < HIDE_HP (until HEALED_HP) > a laser in the first minute > loot
-> stand and strafe against a mech in a fight > roam to the least recently visited cell (scanning).
+> hide out of sight while HP < HIDE_HP (until HEALED_HP) > a laser in the first minute > loot on the ground
+> loot on a roof (only when calm: from within FLY_RANGE, jet straight at it and drop onto it) > stand and strafe against a mech in a fight
+> roam to the least recently visited cell (scanning).
 """
 import math
 import random
@@ -32,6 +33,11 @@ ROAM_CELL = 40.0     # m: cells of the visited map; roaming heads for the one we
 ROAM_REPICK = 25.0   # s: give up on a roam waypoint after this
 HIDE_HP, HEALED_HP = 0.45, 0.9  # HP fraction: hide below the first, go back out at the second
 FIGHT_RANGE = 150.0  # m: a seen mech this close (or one shooting us) stops the roam: stand and strafe
+ROOF_Z = 3.0         # m above the terrain: an item this high is on a roof (a jump clears 2.75 m)
+ROOF_MAX = 45.0      # m: highest roof we jet up to for loot (100 energy climbs about 60 m)
+ROOF_CALM = 120.0    # m: climb only with no known mech this close (in the air we can't dodge)
+ROOF_TIMEOUT = 30.0  # s: give up a roof trip after this (walk up to 200 m, then fly)
+FLY_RANGE = 40.0     # m: walk this close to roof loot, then jet straight at it and drop onto it
 DEBUG = bool(__import__("os").environ.get("BOT_DEBUG"))
 # Upgrade order, one entry per stack; with lightning in hand its two upgrades come right after laser_charge.
 UPGRADE_PLAN = ["plating", "laser_damage", "nanites", "plating", "laser_damage", "laser_charge", "plating", "armor",
@@ -150,6 +156,7 @@ class Bot:
         self.dbg = {}
         self.visited, self.roam, self.roam_t = {}, None, -1e9  # cell -> last t there; current waypoint
         self.hiding, self.cover, self.cover_t = False, None, -1e9
+        self.climb = None                # roof loot: {p: item, t0}
         self.pred = Predictor(self.mech.get("gravity", 22), self.world.ground_at if self.world else None)
 
     # ----- memory -----
@@ -532,16 +539,38 @@ class Bot:
             tgt = wp
         return unit(tgt[0] - pos[0], tgt[1] - pos[1])
 
+    def loot_items(self, me):
+        """Remembered loot we want: weapon pickups we'd take, and cubes while we still gain from them."""
+        out = [p for pid, (kind, p, _) in self.pickups.items() if self.bad_pickups.get(pid, -1) < self.t and self.wants(kind, me)[0]]
+        return out + ([p for p, _ in self.cubes.values()] if me["cubes"] < CUBE_KEEP else [])
+
+    def on_roof(self, p):
+        """Up on a building: above the walkable surface (ground or bridge deck; under a deck a jet only hits it)."""
+        w = self.world
+        if not w or w.free(p[0], p[1]):
+            return False
+        i = w._idx(p[0], p[1])
+        return i >= 0 and p[2] - w.surf[i] > ROOF_Z
+
     def loot_goal(self, me, pos, c, r):
-        best, bd = None, LOOT_RANGE
-        for pid, (kind, p, _) in self.pickups.items():
-            if self.bad_pickups.get(pid, -1) < self.t and self.wants(kind, me)[0] and d2(p, c) < r - 6 and d2(p, pos) < bd:
-                best, bd = p, d2(p, pos)
-        if me["cubes"] < CUBE_KEEP:
-            for p, _ in self.cubes.values():
-                if d2(p, c) < r - 6 and d2(p, pos) < bd:
-                    best, bd = p, d2(p, pos)
-        return best
+        """The nearest wanted loot on the ground (roof loot is roof_target's)."""
+        return min((p for p in self.loot_items(me) if d2(p, c) < r - 6 and d2(p, pos) < LOOT_RANGE and not self.on_roof(p)),
+                   key=lambda p: d2(p, pos), default=None)
+
+    def roof_target(self, me, pos, c, r):
+        """The nearest wanted loot up on a roof we have the energy to jet onto, or None."""
+        def ok(p):
+            return self.on_roof(p) and p[2] - pos[2] <= ROOF_MAX and d2(p, c) < r - 6 and d2(p, pos) < LOOT_RANGE
+        return min((p for p in self.loot_items(me) if ok(p)), key=lambda p: d2(p, pos), default=None)
+
+    def launch_spot(self, p):
+        """The walkable cell nearest to p (the way down off a roof), or None."""
+        for dist in range(2, 32, 2):
+            for i in range(16):
+                q = [p[0] + dist * math.cos(i * math.pi / 8), p[1] + dist * math.sin(i * math.pi / 8)]
+                if self.world.free(*q):
+                    return q
+        return None
 
     # ----- decision -----
     def act(self, obs: mf.Observation) -> mf.Action:
@@ -621,6 +650,14 @@ class Bot:
             engaged = bool(T and T["kind"] == "mech" and T["los"]
                            and (T["d"] < FIGHT_RANGE or t - self.hit_by.get(T["id"], -1e9) < 3))
             hide = self.cover_spot(pos, c, r, enemies, t) if self.hiding and not drop else None
+            calm = (not self.hiding and hpf >= 0.6 and not shot_at and not engaged
+                    and not any(d2(m["pos"], pos) < ROOF_CALM for m in enemies))
+            if self.climb and (t - self.climb["t0"] > ROOF_TIMEOUT or (me["grounded"] and not calm and not self.on_roof(pos))):
+                self.climb = None  # trouble while still on the ground: forget the roof
+            if not self.climb and calm and not (drop or hide or early or loot):
+                rp = self.roof_target(me, pos, c, r)
+                if rp:
+                    self.climb = dict(p=rp, t0=t)
             if drop:
                 goal, mode, arrive = drop["pos"], "drop", max(drop["radius"] - 3, 1.0)
             elif hide:
@@ -629,6 +666,8 @@ class Bot:
                 goal, mode, arrive = early, "laser", 1.0
             elif loot:
                 goal, mode, arrive = loot, "loot", 1.0
+            elif self.climb:
+                goal, mode, arrive = self.climb["p"], "roof", 1.0
             elif engaged:
                 goal, mode = list(pos[:2]), "fight"  # stand and trade, strafing (running off loses fights)
             else:
@@ -637,6 +676,22 @@ class Bot:
                     goal, mode, arrive = roam, "roam", 6.0
 
         gap = d2(goal, pos)
+        climbing = False
+        if move is None and mode == "roof":
+            top, ms = goal[2], self.mech
+            # jet time to get over it: rising to its height or crossing the gap, whichever is longer, plus a margin
+            need = ms.get("jet_drain", 15) * (max((top - z) / ms.get("max_rise_speed", 10), gap / ms.get("walk_speed", 11.7)) + 1.5)
+            if me["grounded"] and z < top - 1 and (gap > FLY_RANGE or me["energy"] < need):
+                move = self.steer(pos, goal, t) if gap > FLY_RANGE else [0.0, 0.0]  # closer first / let energy refill
+            else:
+                move = unit(goal[0] - x, goal[1] - y)  # fly straight at it with the jet held...
+                climbing = gap > 3 or z < top - 1      # ...until over it, then let go and drop onto it
+                if gap < 1.5 and z > top - 1:
+                    self.climb = None                  # there: the take / cube pickup happens on its own
+        if move is None and mode != "roof" and self.on_roof(pos) and gap > arrive:
+            down = self.launch_spot(pos)  # A* sees roofs as walls: walk off the nearest edge first
+            if down:
+                move = unit(down[0] - x, down[1] - y)
         if move is None:
             move = self.steer(pos, goal, t, force=self.stuck_since is not None and t - self.stuck_since > 1) if gap > arrive else [0.0, 0.0]
             if mode in ("edge", "fight") and T and T["kind"] == "mech" and T["los"]:  # strafe across their line of fire
@@ -653,9 +708,10 @@ class Bot:
         wants_move = math.hypot(*move) > 0.5
         self.hist = [h for h in self.hist if t - h[0] < 1.2] + [(t, x, y, wants_move)]
         h0 = self.hist[0]
-        stuck = len(self.hist) >= 10 and all(h[3] for h in self.hist) and math.hypot(x - h0[1], y - h0[2]) < 1.5
+        stuck = (len(self.hist) >= 10 and all(h[3] for h in self.hist) and math.hypot(x - h0[1], y - h0[2]) < 1.5
+                 and not climbing)  # pressed to the wall while jetting up is the plan, not stuck
         self.stuck_since = (t if self.stuck_since is None else self.stuck_since) if stuck else None
-        jump = False
+        jump = climbing and me["grounded"]
         if t < self.unstick_until:
             move = self.unstick_dir
         elif stuck:
@@ -664,8 +720,8 @@ class Bot:
                 a = math.atan2(move[1], move[0]) + self.rng.choice((-1, 1)) * math.pi / 2
                 self.unstick_dir, self.unstick_until = [math.cos(a), math.sin(a)], t + 1.0
                 self.stuck_since, self.path = None, []
-        boost = mode in ("dodge shell", "zone") or (stuck and not fighting) or (
-            gap > 40 and me["energy"] > 60 and not T)
+        boost = climbing or mode in ("dodge shell", "zone") or (stuck and not fighting) or (
+            gap > 40 and me["energy"] > 60 and not T and mode != "roof")  # save the energy for the jet
         if fighting:  # boost through the whole fight, walking just long enough to recharge (duel-tested; jets lost)
             self.burn = me["energy"] > 70 if not self.burn else me["energy"] > 25
             boost = boost or (self.burn and me["grounded"])

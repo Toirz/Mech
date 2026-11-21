@@ -51,7 +51,7 @@ class World:
         lo = self.lo = array.array("f", [1e9]) * (nx * ny)
         hi = self.hi = array.array("f", [-1e9]) * (nx * ny)
         wall = bytearray(nx * ny)
-        surf = array.array("f", ground)  # what you walk on: ground, or a low bridge deck
+        surf = self.surf = array.array("f", ground)  # what you walk on: ground, or a low bridge deck
         height, step = mech.get("height", 9), mech.get("step_up", 1.2)
         for p in w["prisms"]:
             pb, pt, bridge = p["base"], p["top"], p["kind"] == "bridge"
