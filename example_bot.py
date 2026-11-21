@@ -495,6 +495,8 @@ class Bot:
                 if land and land[2] < 3 and d2(land, pos) < mo["splash_radius"] * 1.3 + 3:
                     v = unit(pos[0] - land[0], pos[1] - land[1])
                     return (v if v != [0.0, 0.0] else [-p["vel"][1], p["vel"][0]]), "dodge shell"
+        if not me["in_zone"]:
+            return None  # outside, getting back in comes first: the zone hurts more than a sidestep saves
         c = [pos[0], pos[1], pos[2] + self.mech["height"] / 2]
         for p in obs["projectiles"]:  # a bullet headed for our body: step out of its line (at 100 m it flies 0.4 s)
             if p["kind"] != "mortar":
@@ -502,8 +504,17 @@ class Bot:
                 if 0 < tca < 0.6 and math.hypot(*miss[:2]) < self.mech["radius"] + 1.0:
                     side = unit(miss[0], miss[1]) if math.hypot(*miss[:2]) > 0.3 else [v * self.strafe_sign for v in
                                                                                      unit(-p["vel"][1], p["vel"][0])]
-                    return side, "dodge bullet"
+                    side = next((v for v in (side, [-side[0], -side[1]]) if self.safe_step(pos, v)), None)
+                    if side:
+                        return side, "dodge bullet"
         return None
+
+    def safe_step(self, pos, v, d=4.0):
+        """Can we boost d m along v without hitting a wall or going over a ledge?"""
+        if not self.world:
+            return True
+        q = [pos[0] + v[0] * d, pos[1] + v[1] * d]
+        return self.world.line_free(pos, q) and abs(self.world.ground_at(q[0], q[1], pos[2]) - pos[2]) < 2.5
 
     def free_edge_spot(self, pos, c, r):
         """edge_spot, kept inside the map (the first zone is bigger than it), slid along the circle to a walkable cell."""
@@ -524,32 +535,41 @@ class Bot:
         return spot
 
     def exposure(self, p):
-        """Share of 8 directions from which a mech 60 m away could shoot a mech standing at p (0 = walled in)."""
+        """Share of 8 directions from which a mech 60 m away could shoot a mech standing at p (0 = walled in).
+        At most 3 new cells per decision (about 2 ms); the rest count as half open until a later decision fills them."""
         key = (round(p[0] / 4), round(p[1] / 4))
         if key not in self.open_cache:
+            if self.open_new >= 3:
+                return 0.5
+            self.open_new += 1
             z = self.world.ground_at(p[0], p[1], 0.0) + self.mech["eye_height"]
             a = [p[0], p[1], z]
             self.open_cache[key] = sum(self.world.clear(a, [p[0] + 60 * math.cos(k * math.pi / 4), p[1] + 60 * math.sin(k * math.pi / 4), z])
                                        for k in range(8)) / 8
         return self.open_cache[key]
 
-    def edge_goal(self, pos, c, r, enemies, hold):
+    def edge_goal(self, pos, c, r, enemies, hold, zone, speed):
         """The edge spot with the least risk: the walk there, known and guessed mechs near it, and open lines of fire.
         Re-picked once a second (never mid-fight) while it stays inside the circle."""
         base = self.free_edge_spot(pos, c, r)
-        if not self.world:
+        if not self.world or hold is None:  # outside the zone: the closest way back in, no detours
+            self.spot = None
             return base
         rr = max(r - EDGE_MARGIN, 1.0)
-        if self.spot and d2(self.spot, c) < rr + EDGE_MARGIN / 2 and (hold or self.t - self.spot_t < 1.0):
+        if self.spot and d2(self.spot, c) < rr + 1 and (hold or self.t - self.spot_t < 1.0):
             return self.spot
         a0 = math.atan2(base[1] - c[1], base[0] - c[0])
         threats = [(m["pos"], 1.5 if "laser" in m.get("weapons", []) else 1.0) for m in enemies] + [(g, g[3]) for g in self.ghosts]
         best, bs = base, 1e9
+        self.open_new = 0
         for k in range(-4, 5):
             a = a0 + k * min(15 / rr, 0.3)
             p = base if k == 0 else self.world.clamp([c[0] + math.cos(a) * rr, c[1] + math.sin(a) * rr], MAP_MARGIN)
             if k and not self.world.free(*p):
                 continue
+            zc, zr = zone_at(zone, self.t + d2(p, pos) / speed + LOOKAHEAD_S)
+            if k and d2(p, zc) > zr - EDGE_MARGIN / 2:
+                continue  # a shrinking zone would pass us on the way there
             s = (d2(p, pos) / 40 + sum(w / max(d2(p, q) / 60, 0.5) for q, w in threats) + 1.5 * self.exposure(p)
                  - (0.3 if self.spot and d2(p, self.spot) < 8 else 0))  # a little stickiness: no flip-flopping
             if s < bs:
@@ -632,7 +652,8 @@ class Bot:
 
         # Movement goal.
         c, r = zone_at(obs["zone"], t + LOOKAHEAD_S)
-        spot = self.edge_goal(pos, c, r, enemies, hold=bool(T and T["kind"] == "mech" and T["los"]))
+        spot = self.edge_goal(pos, c, r, enemies, None if not me["in_zone"] else bool(T and T["kind"] == "mech" and T["los"]),
+                              obs["zone"], st.get("walk_speed", 11.7))
         safe_r = max(r - EDGE_MARGIN, 0.0)
         arrive, mode, goal, move = ARRIVED, "edge", spot, None
         dodge = self.dodge(obs, me, pos)
