@@ -257,7 +257,7 @@ class Bot:
         if hpf < 0.6:
             return None
         for x in sorted(others, key=lambda x: (x["kind"] != "npc", x["d"])):
-            if x["d"] < (150 if x["kind"] == "npc" else 120) and (x["kind"] == "npc" or me["cubes"] < CUBE_KEEP or None in me["weapons"]):
+            if x["d"] < GUN_OPEN and (x["kind"] == "npc" or me["cubes"] < CUBE_KEEP or None in me["weapons"]):  # the gun's noise carries 320 m
                 x["los"] = self.los(muzzle, x["c"])
                 if x["los"]:
                     return x
@@ -286,7 +286,7 @@ class Bot:
                 k, st = w["kind"], w["stats"]
                 if k == "gun":
                     pt, p_hit = self._gun_dbg = self.gun_point(muzzle, T, w)
-                    joined = T["kind"] != "mech" or t - max(self.hit_by.get(T["id"], -1e9), self.hit_on.get(T["id"], -1e9)) < 5
+                    joined = t - max(self.hit_by.get(T["id"], -1e9), self.hit_on.get(T["id"], -1e9)) < 5  # crates and drones too
                     if pt:
                         aims[i], dists[i] = aim_at(muzzle, pt), math.dist(muzzle, pt)
                     ok[i] = (pt is not None and T["los"] and T["d"] <= (st["range"] if joined else GUN_OPEN) and w.get("ammo", 1) > 0
@@ -297,7 +297,8 @@ class Bot:
                         aims[i], dists[i] = aim_at(muzzle, pt), math.dist(muzzle, pt)
                     else:
                         aims[i] = aim_at(muzzle, T["c"])
-                    ok[i] = pt is not None and T["los"] and T["d"] <= st["range"] and t >= self.short_until
+                    ok[i] = (pt is not None and T["los"] and T["d"] <= st["range"] and t >= self.short_until
+                             and (T["kind"] == "mech" or t - self.hit_by.get(T["id"], -1e9) < 3))  # kept ready for mechs (1.65 s cooldown)
                 elif k == "lightning":
                     pt = self.point_at(T, LATENCY, T["c"][2] - T["pos"][2])
                     aims[i], dists[i] = aim_at(muzzle, pt), math.dist(muzzle, pt)
