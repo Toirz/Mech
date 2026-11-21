@@ -35,15 +35,6 @@ assert mortar_aim([0, 0, 0], [1000, 0, 0], [0, 0, 0], v, g) is None  # out of ra
 x, y, lt = shell_landing([0, 0, 50], [10, 0, 5], g, 0)
 assert abs(50 + 5 * lt - g * lt * lt / 2) < 1e-9 and abs(x - 10 * lt) < 1e-9
 
-# Weapon choice follows the zone: a laser replaces a lightning while it is wide, the other way round once narrow.
-from example_bot import Bot
-b = object.__new__(Bot)
-gun = {"kind": "gun"}
-for narrow, have, offered in ((False, "lightning", "laser"), (True, "laser", "lightning")):
-    b.narrow = narrow
-    assert b.wants(offered, {"weapons": [gun, {"kind": have}]}) == (True, 1)
-    assert b.wants(have, {"weapons": [gun, {"kind": offered}]}) == (False, 1)
-
 # Map model, when the kit's arena folder is next to this one.
 arena = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "arena")
 if os.path.isdir(arena):
