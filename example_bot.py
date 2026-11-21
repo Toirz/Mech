@@ -146,6 +146,8 @@ class Bot:
         self.hit_by, self.hit_on = {}, {}  # id -> last time it damaged us / we damaged it
         self.foes = {}                   # mech id -> (pos, t) last listed in obs.mechs
         self.ghosts = []                 # [x, y, t, w]: where an unseen mech probably is (sound, hit from out of view, left view)
+        self.spot, self.spot_t = None, -1e9  # the edge spot we picked, and when
+        self.open_cache = {}             # 4 m cell -> share of 8 directions with a clear 60 m line of fire
         self.dbg = {}
         self.pred = Predictor(self.mech.get("gravity", 22), self.world.ground_at if self.world else None)
 
@@ -502,6 +504,40 @@ class Bot:
                     return p
         return spot
 
+    def exposure(self, p):
+        """Share of 8 directions from which a mech 60 m away could shoot a mech standing at p (0 = walled in)."""
+        key = (round(p[0] / 4), round(p[1] / 4))
+        if key not in self.open_cache:
+            z = self.world.ground_at(p[0], p[1], 0.0) + self.mech["eye_height"]
+            a = [p[0], p[1], z]
+            self.open_cache[key] = sum(self.world.clear(a, [p[0] + 60 * math.cos(k * math.pi / 4), p[1] + 60 * math.sin(k * math.pi / 4), z])
+                                       for k in range(8)) / 8
+        return self.open_cache[key]
+
+    def edge_goal(self, pos, c, r, enemies, hold):
+        """The edge spot with the least risk: the walk there, known and guessed mechs near it, and open lines of fire.
+        Re-picked once a second (never mid-fight) while it stays inside the circle."""
+        base = self.free_edge_spot(pos, c, r)
+        if not self.world:
+            return base
+        rr = max(r - EDGE_MARGIN, 1.0)
+        if self.spot and d2(self.spot, c) < rr + EDGE_MARGIN / 2 and (hold or self.t - self.spot_t < 1.0):
+            return self.spot
+        a0 = math.atan2(base[1] - c[1], base[0] - c[0])
+        threats = [(m["pos"], 1.5 if "laser" in m.get("weapons", []) else 1.0) for m in enemies] + [(g, g[3]) for g in self.ghosts]
+        best, bs = base, 1e9
+        for k in range(-4, 5):
+            a = a0 + k * min(15 / rr, 0.3)
+            p = base if k == 0 else self.world.clamp([c[0] + math.cos(a) * rr, c[1] + math.sin(a) * rr], MAP_MARGIN)
+            if k and not self.world.free(*p):
+                continue
+            s = (d2(p, pos) / 40 + sum(w / max(d2(p, q) / 60, 0.5) for q, w in threats) + 1.5 * self.exposure(p)
+                 - (0.3 if self.spot and d2(p, self.spot) < 8 else 0))  # a little stickiness: no flip-flopping
+            if s < bs:
+                best, bs = p, s
+        self.spot, self.spot_t = best, self.t
+        return best
+
     def steer(self, pos, goal, t, force=False):
         """Unit move vector toward goal along an A* path."""
         if not self.world:
@@ -577,7 +613,7 @@ class Bot:
 
         # Movement goal.
         c, r = zone_at(obs["zone"], t + LOOKAHEAD_S)
-        spot = self.free_edge_spot(pos, c, r)
+        spot = self.edge_goal(pos, c, r, enemies, hold=bool(T and T["kind"] == "mech" and T["los"]))
         safe_r = max(r - EDGE_MARGIN, 0.0)
         arrive, mode, goal, move = ARRIVED, "edge", spot, None
         dodge = self.dodge(obs, me, pos)
