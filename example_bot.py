@@ -138,7 +138,7 @@ class Bot:
             self.world = World(hello["map"]["dir"], self.mech)
         except Exception as e:  # without the map we still play: straight lines, no cover checks
             mf.log(f"map not loaded, playing without it: {e!r}")
-        self.path, self.path_goal, self.path_t, self.search = [], None, -1e9, None
+        self.path, self.path_goal, self.path_t = [], None, -1e9
         self.hist = []                   # (t, x, y, wanted to move)
         self.stuck_since = None
         self.unstick_until, self.unstick_dir = -1.0, [0.0, 0.0]
@@ -526,17 +526,8 @@ class Bot:
         """Unit move vector toward goal along an A* path."""
         if not self.world:
             return unit(goal[0] - pos[0], goal[1] - pos[1])
-        new_goal = self.path_goal is None or d2(goal, self.path_goal) > 6
-        if force or new_goal or (not self.path and not self.search) or (t - self.path_t > 2.5 and not self.search):
-            self.search, self.path_t = self.world.search(pos, goal), t
-        if self.search:  # a long search runs over several decisions; until it ends we keep the old path for this goal
-            done = self.world.advance(self.search, PATH_BUDGET)
-            if done or new_goal or not self.path:
-                path, self.path_goal = self.world.route(self.search), list(goal)
-                near = min(range(min(len(path), 10)), key=lambda i: d2(pos, path[i]), default=0)
-                self.path = path[near:]  # we walked on while it searched
-            if done:
-                self.search = None
+        if force or not self.path or self.path_goal is None or d2(goal, self.path_goal) > 6 or t - self.path_t > 2.5:
+            self.path, self.path_goal, self.path_t = self.world.path(pos, goal, PATH_BUDGET), list(goal), t
         while len(self.path) > 1 and d2(pos, self.path[0]) < 4:
             self.path.pop(0)
         if not self.path:
@@ -730,7 +721,7 @@ class Bot:
             if t - self.stuck_since > 2.5:
                 a = math.atan2(move[1], move[0]) + self.rng.choice((-1, 1)) * math.pi / 2
                 self.unstick_dir, self.unstick_until = [math.cos(a), math.sin(a)], t + 1.0
-                self.stuck_since, self.path, self.search = None, [], None
+                self.stuck_since, self.path = None, []
         boost = climbing or mode in ("dodge shell", "zone") or (stuck and not fighting) or (
             gap > 40 and me["energy"] > 60 and not T and mode != "roof")  # save the energy for the jet
         if fighting:  # boost through the whole fight, walking just long enough to recharge (duel-tested; jets lost)
