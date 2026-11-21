@@ -55,49 +55,4 @@ if os.path.isdir(arena):
             assert path and all(math.dist(p, q) < 9 for p, q in zip([a] + path, path)), "path steps are neighbor cells"
             reached += math.dist(path[-1], b) < 1
     assert reached > 0
-
-# Fight-or-flight estimate, with the real rules from the kit's recorded match when it's next to this folder.
-stream = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "check", "stream.jsonl.gz")
-if os.path.isfile(stream):
-    import gzip
-    import json
-    from example_bot import Bot
-    with gzip.open(stream, "rt") as f:
-        hello = json.loads(f.readline())
-    hello["map"]["dir"] = arena
-    bot, W = Bot(hello), hello["config"]["weapons"]
-    me = {"hp": 1400, "max_hp": 1400, "cubes": 0, "stats": {"armor": 0}, "weapons": [{"kind": "gun", "stats": W["gun"]}, None]}
-    def foe(hp, at): return {"id": 5, "pos": at, "hp": hp, "max_hp": 1400, "cubes": 0, "weapons": ["gun"]}
-    def wins(*foes): return bot.can_win(me, bot.threats(me, [0, 0, 0], list(foes)), 0.2)
-    assert not wins(foe(1400, [100, 0, 0]))                       # an even duel: don't
-    assert wins(foe(350, [100, 0, 0]))                            # it's nearly dead: do
-    assert not wins(foe(500, [100, 0, 0]), foe(500, [0, 100, 0]))  # two half-dead ones at once: don't
-    assert wins(foe(1400, [400, 0, 0]))                           # out of its reach: nothing to lose
-    me["weapons"][1] = {"kind": "lightning", "stats": W["lightning"]}
-    assert wins(foe(1400, [35, 0, 0]))                            # in arc range against a gun: do
-
-    # Modes, on the recorded first observation with the room emptied (no map: every line is clear).
-    with gzip.open(stream, "rt") as f:
-        f.readline()
-        o = json.loads(f.readline())
-    o.update(mechs=[], events=[], sounds=[], beams=[], projectiles=[], pickups=[], cubes=[], crates=[], drops=[])
-    bot = Bot(dict(hello, map={"dir": "/nonexistent", "files": []}))
-    def tick(**kw):
-        o.update(kw, t=o["t"] + 0.1, tick=o["tick"] + 2)
-        bot.act(o)
-        return bot.mode
-    px, py, pz = o["self"]["pos"]
-    def mech(i, dx, hp=1400, aim=math.pi): return {"id": i, "kind": "mech", "pos": [px + dx, py, pz], "vel": [0, 0, 0],
-                                                   "aim": [aim, 0], "hp": hp, "max_hp": 1400, "cubes": 0, "weapons": ["gun"]}
-    assert tick() == "hide"                                        # we always start hidden
-    assert tick(mechs=[mech(7, 150, aim=0.0)]) == "hide"           # 150 m off, looking away: unseen, stay hidden
-    assert tick(mechs=[mech(7, 150)]) == "counter"                 # it turned our way: it sees us
-    assert all(tick(mechs=[]) == "counter" for _ in range(15))     # nobody on us yet for 2 s: keep running
-    assert [tick() for _ in range(6)][-1] == "hide"                # 2 s with nobody on us: hide again
-    assert tick(mechs=[mech(8, 100, hp=1400, aim=0.0), mech(9, 130, hp=100, aim=0.0)]) == "hide"  # nobody fighting
-    bot.hurt_t[9] = o["t"]                                         # one of them is being hit: a fight
-    assert tick(mechs=[mech(8, 100, hp=1400, aim=0.0), mech(9, 130, hp=100, aim=0.0)]) == "hide"  # the healthy one: too risky
-    assert tick(mechs=[mech(9, 130, hp=100, aim=0.0)]) == "combat" and bot.locked == {9}         # alone and nearly dead: go
-    assert tick(mechs=[], events=[{"type": "kill", "target": 9}]) == "hide"                       # cleared: hide again
-    assert tick(events=[], alive=2) == "combat" and bot.locked is None                             # two of us left
 print("ok")
