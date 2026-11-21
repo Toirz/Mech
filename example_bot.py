@@ -1,7 +1,8 @@
 """Bot: hold the inside edge of the zone, fight with the right weapon for the range, dodge, loot, use the map to path and aim.
 
-Priorities each decision (movement): dodge a laser/shell > get back in the zone > flee when weak
-> capture a supply drop > grab nearby loot > hold the zone edge (strafing while fighting).
+Priorities each decision (movement): dodge a shell > get back in the zone > early laser
+> capture a supply drop > grab nearby loot > hold the zone edge (strafing, clear of walls, across
+whoever we see shooting, or across the bearing of a hit from someone we can't see).
 """
 import math
 import random
@@ -21,6 +22,8 @@ MECH_SOUNDS = {"gun", "mortar", "laser", "laser_charge", "lightning", "step", "b
 WEAPON_VALUE = {"laser": 1.0, "lightning": 0.7, "gun": 0.5}  # never a mortar: a laser hit on its carrier cooks off (+60%)
 EARLY_S, EARLY_RANGE = 60.0, 250.0  # the first minute: walk this far for a laser (else a lightning)
 GUN_OPEN = 100.0     # m: the gun doesn't start a fight with a mech farther than this (it joins one at any range)
+STRAFE_PROBE = 8.0   # m: a strafe step must have this much walkable ground ahead (~0.6 s at boost)
+EVADE_S = 2.0        # s: after a hit from someone we can't see, keep strafing across that bearing this long
 # Upgrade order, one entry per stack; with lightning in hand its two upgrades come right after laser_charge.
 UPGRADE_PLAN = ["plating", "laser_damage", "nanites", "plating", "laser_damage", "laser_charge", "plating", "armor",
                 "gun_damage", "gun_rate", "sensors", "armor", "gyros"]
@@ -389,6 +392,43 @@ class Bot:
             tgt = wp
         return unit(tgt[0] - pos[0], tgt[1] - pos[1])
 
+    def walkable(self, pos, v, dist=STRAFE_PROBE):
+        """True if the ground `dist` m along unit vector v is open (our own nav cell is skipped:
+        standing next to a wall, the coarse grid would mark it blocked)."""
+        if not self.world:
+            return True
+        w = self.world
+        c0 = w.nav_cell(pos[0], pos[1])
+        for k in range(1, int(dist / 2) + 1):
+            px, py = pos[0] + v[0] * 2 * k, pos[1] + v[1] * 2 * k
+            if w.nav_cell(px, py) != c0 and not w.free(px, py):
+                return False
+        return True
+
+    def strafe(self, pos, to_goal, gap, foe_yaw, t):
+        """Move across the line to a shooter at world yaw foe_yaw, reversing every 0.35-0.9 s, pulled
+        toward the goal along `to_goal` (the A* direction). Never into a wall: a blocked side flips
+        the strafe at once; both sides blocked -> back off (diagonally, then straight), else forward diagonally, else follow the path."""
+        if t >= self.strafe_until:
+            self.strafe_sign, self.strafe_until = -self.strafe_sign, t + self.rng.uniform(0.35, 0.9)  # reverse before their led shot lands
+        pull = min(gap / 6, 1.0)
+
+        def mix(sign):
+            yaw = foe_yaw + sign * math.pi / 2
+            return unit(math.cos(yaw) + to_goal[0] * pull, math.sin(yaw) + to_goal[1] * pull)
+        for sign in (self.strafe_sign, -self.strafe_sign):
+            v = mix(sign)
+            if v != [0.0, 0.0] and self.walkable(pos, v):
+                if sign != self.strafe_sign:
+                    self.strafe_sign, self.strafe_until = sign, t + self.rng.uniform(0.35, 0.9)
+                return v
+        for a in (0.75, -0.75, 1.0, 0.25, -0.25):  # both sides walled in: back off diagonally, then straight back, then forward diagonally
+            yaw = foe_yaw + self.strafe_sign * a * math.pi
+            v = [math.cos(yaw), math.sin(yaw)]
+            if self.walkable(pos, v):
+                return v
+        return to_goal
+
     def loot_goal(self, me, pos, c, r):
         best, bd = None, LOOT_RANGE
         for pid, (kind, p, _) in self.pickups.items():
@@ -469,20 +509,22 @@ class Bot:
             elif loot:
                 goal, mode, arrive = loot, "loot", 1.0
 
+        # Whom to strafe against: a mech we can see, else whoever hit us lately that we can't see
+        # (standing still there makes us a free target until we turn and find them).
+        seen = bool(T and T["kind"] == "mech" and T["los"])
+        evading = not seen and me["in_zone"] and self.threat is not None and t - self.threat[1] < EVADE_S
+        foe_yaw = math.atan2(T["pos"][1] - y, T["pos"][0] - x) if seen else self.threat[0] if evading else None
+
         gap = d2(goal, pos)
         if move is None:
             move = self.steer(pos, goal, t, force=self.stuck_since is not None and t - self.stuck_since > 1) if gap > arrive else [0.0, 0.0]
-            if mode == "edge" and T and T["kind"] == "mech" and T["los"]:  # strafe across their line of fire
-                if t >= self.strafe_until:
-                    self.strafe_sign, self.strafe_until = -self.strafe_sign, t + self.rng.uniform(0.35, 0.9)  # reverse before their led shot lands
-                yaw = math.atan2(T["pos"][1] - y, T["pos"][0] - x) + self.strafe_sign * math.pi / 2
-                pull = min(gap / 6, 1.0)
-                to_spot = unit(goal[0] - x, goal[1] - y)
-                move = unit(math.cos(yaw) + to_spot[0] * pull, math.sin(yaw) + to_spot[1] * pull)
+            if mode == "edge" and foe_yaw is not None:  # strafe across their line of fire
+                to_goal = move if gap > arrive else unit(goal[0] - x, goal[1] - y)
+                move = self.strafe(pos, to_goal, gap, foe_yaw, t)
 
         # Stuck: commanded to move but not getting anywhere -> jump and jet; if that fails too, sidestep.
         # Not while fighting inside the zone (hopping about loses the fight); outside it the zone kills faster than they do.
-        fighting = bool(T and T["kind"] == "mech" and T["los"] and me["in_zone"])
+        fighting = (seen and me["in_zone"]) or evading
         wants_move = math.hypot(*move) > 0.5
         self.hist = [h for h in self.hist if t - h[0] < 1.2] + [(t, x, y, wants_move)]
         h0 = self.hist[0]
