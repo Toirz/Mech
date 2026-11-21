@@ -26,11 +26,6 @@ LATENCY = 0.03       # s from an observation to the shot leaving (the action app
 GUN_TOL = 1.0        # m: the gun fires only when its aim is this close to the lead point, at the target
 GUN_MIN_P = 0.15     # the gun holds fire below this estimated hit chance
 LASER_MARGIN = 0.8   # m: the beam must point this far inside the target's edge when we let go
-DROP_HP = 0.7        # go for a supply drop only with this much HP,
-DROP_CALM_S = 5.0    # not shot at for this long,
-DROP_CLEAR, DROP_CLEAR_S = 150.0, 10.0  # and no mech seen this close to it in this long (it's where the whole map heads)
-HOP_JET_S = 0.6      # s of jet after an unstick hop (jump 2.75 m + this clears any ledge we path over)
-QUIET_MOVE = 0.42   # |move| under 5 m/s (0.42 of 11.7): no step sound
 DEBUG = bool(__import__("os").environ.get("BOT_DEBUG"))
 # Upgrade order, one entry per stack; with lightning in hand its two upgrades come right after laser_charge.
 UPGRADE_PLAN = ["plating", "laser_damage", "nanites", "plating", "laser_damage", "laser_charge", "plating", "armor",
@@ -135,7 +130,6 @@ class Bot:
         self.hist = []                   # (t, x, y, wanted to move)
         self.stuck_since = None
         self.unstick_until, self.unstick_dir = -1.0, [0.0, 0.0]
-        self.hop_t = -1e9                # last unstick hop
         self.threat = None               # (bearing, t) of the last hit we took
         self.turn_to = None              # (bearing, t): hit in the back by someone we can't see: face that way a moment
         self.heard = None                # (bearing, t, dist) of the last mech sound
@@ -147,8 +141,6 @@ class Bot:
         self.cubes = {}                  # id -> (pos, t seen)
         self.bad_pickups = {}            # id -> t until we stop trying it
         self.hit_by, self.hit_on = {}, {}  # id -> last time it damaged us / we damaged it
-        self.foes = {}                   # mech id -> (pos, t) last seen
-        self.shot_t = {}                 # mech id -> last time we fired at it
         self.dbg = {}
         self.pred = Predictor(self.mech.get("gravity", 22), self.world.ground_at if self.world else None)
 
@@ -160,18 +152,14 @@ class Bot:
             self.cubes[c["id"]] = (c["pos"], t)
         seen_p = {p["id"] for p in obs["pickups"]}
         seen_c = {c["id"] for c in obs["cubes"]}
-        seen_m = {m["id"] for m in obs["mechs"]}
-        # Close by, in sight and not listed: someone took it (one behind a wall or on a roof just isn't seen). Old memories expire.
-        eye = [pos[0], pos[1], pos[2] + self.mech["eye_height"]]
-
-        def gone(p):
-            return d2(p, pos) < 25 and self.los(eye, [p[0], p[1], p[2] + 0.5])
-        self.pickups = {k: v for k, v in self.pickups.items() if (k in seen_p or not gone(v[1])) and t - v[2] < 60}
-        self.cubes = {k: v for k, v in self.cubes.items() if (k in seen_c or not gone(v[0])) and t - v[1] < 60}
+        # Close by and not listed: someone took it. Old memories expire.
+        self.pickups = {k: v for k, v in self.pickups.items()
+                        if (k in seen_p or d2(v[1], pos) > 25) and t - v[2] < 60}
+        self.cubes = {k: v for k, v in self.cubes.items() if (k in seen_c or d2(v[0], pos) > 25) and t - v[1] < 60}
         for e in obs["events"]:
             if e["type"] == "damaged" and e.get("bearing") is not None:
                 self.threat = (e["bearing"], t)
-                if e.get("rear") or (e.get("by") is not None and e["by"] not in seen_m):  # behind us, or out of view (60-90 deg off)
+                if e.get("rear"):
                     self.turn_to = (e["bearing"], t)
                 if e.get("by") is not None:
                     self.hit_by[e["by"]] = t
@@ -185,10 +173,6 @@ class Bot:
                 self.pickups.pop(e["id"], None)
             elif e["type"] == "effect" and e["effect"] == "short":
                 self.short_until = t + self.cfg["weapons"]["lightning"].get("short_s", 2)
-        for m in obs["mechs"]:
-            if m["kind"] == "mech":
-                self.foes[m["id"]] = (m["pos"], t)
-        self.foes = {k: v for k, v in self.foes.items() if t - v[1] < DROP_CLEAR_S}
         sounds = [s for s in obs["sounds"] if s["kind"] in MECH_SOUNDS]
         if sounds:
             s = min(sounds, key=lambda s: (["near", "mid", "far"].index(s["dist"]), s["age"]))
@@ -196,10 +180,6 @@ class Bot:
 
     def los(self, a, b):
         return self.world.clear(a, b) if self.world else True
-
-    def on_roof(self, p):
-        """Is this point more than 3 m above the ground under it (a roof: no walking up to it)?"""
-        return bool(self.world) and p[2] - self.world.ground_at(p[0], p[1], p[2]) > 3
 
     # ----- weapons -----
     def wants(self, kind, me):
@@ -230,8 +210,6 @@ class Bot:
                 others.append(dict(id=m["id"], kind="npc", pos=m["pos"], c=c, vel=m["vel"], r=n["radius"], m=m))
         cr = self.cfg["crates"]
         for k in obs["crates"]:
-            if self.on_roof(k["pos"]):
-                continue  # its cube would land where we can't walk
             c = [k["pos"][0], k["pos"][1], k["pos"][2] + cr["height"] / 2]
             others.append(dict(id=k["id"], kind="crate", pos=k["pos"], c=c, vel=[0, 0, 0], r=cr["radius"], m=k))
         for x in mechs + others:
@@ -257,7 +235,7 @@ class Bot:
         if hpf < 0.6:
             return None
         for x in sorted(others, key=lambda x: (x["kind"] != "npc", x["d"])):
-            if x["d"] < GUN_OPEN and (x["kind"] == "npc" or me["cubes"] < CUBE_KEEP or None in me["weapons"]):  # the gun's noise carries 320 m
+            if x["d"] < (150 if x["kind"] == "npc" else 120) and (x["kind"] == "npc" or me["cubes"] < CUBE_KEEP or None in me["weapons"]):
                 x["los"] = self.los(muzzle, x["c"])
                 if x["los"]:
                     return x
@@ -286,7 +264,7 @@ class Bot:
                 k, st = w["kind"], w["stats"]
                 if k == "gun":
                     pt, p_hit = self._gun_dbg = self.gun_point(muzzle, T, w)
-                    joined = t - max(self.hit_by.get(T["id"], -1e9), self.hit_on.get(T["id"], -1e9)) < 5  # crates and drones too
+                    joined = T["kind"] != "mech" or t - max(self.hit_by.get(T["id"], -1e9), self.hit_on.get(T["id"], -1e9)) < 5
                     if pt:
                         aims[i], dists[i] = aim_at(muzzle, pt), math.dist(muzzle, pt)
                     ok[i] = (pt is not None and T["los"] and T["d"] <= (st["range"] if joined else GUN_OPEN) and w.get("ammo", 1) > 0
@@ -297,8 +275,7 @@ class Bot:
                         aims[i], dists[i] = aim_at(muzzle, pt), math.dist(muzzle, pt)
                     else:
                         aims[i] = aim_at(muzzle, T["c"])
-                    ok[i] = (pt is not None and T["los"] and T["d"] <= st["range"] and t >= self.short_until
-                             and (T["kind"] == "mech" or t - self.hit_by.get(T["id"], -1e9) < 3))  # kept ready for mechs (1.65 s cooldown)
+                    ok[i] = pt is not None and T["los"] and T["d"] <= st["range"] and t >= self.short_until
                 elif k == "lightning":
                     pt = self.point_at(T, LATENCY, T["c"][2] - T["pos"][2])
                     aims[i], dists[i] = aim_at(muzzle, pt), math.dist(muzzle, pt)
@@ -493,12 +470,11 @@ class Bot:
     def loot_goal(self, me, pos, c, r):
         best, bd = None, LOOT_RANGE
         for pid, (kind, p, _) in self.pickups.items():
-            if (self.bad_pickups.get(pid, -1) < self.t and self.wants(kind, me)[0] and d2(p, c) < r - 6 and d2(p, pos) < bd
-                    and not self.on_roof(p)):  # we'd walk into its wall
+            if self.bad_pickups.get(pid, -1) < self.t and self.wants(kind, me)[0] and d2(p, c) < r - 6 and d2(p, pos) < bd:
                 best, bd = p, d2(p, pos)
         if me["cubes"] < CUBE_KEEP:
             for p, _ in self.cubes.values():
-                if d2(p, c) < r - 6 and d2(p, pos) < bd and not self.on_roof(p):
+                if d2(p, c) < r - 6 and d2(p, pos) < bd:
                     best, bd = p, d2(p, pos)
         return best
 
@@ -542,14 +518,9 @@ class Bot:
         near = min(enemies, key=lambda m: d2(m["pos"], pos), default=None)
         T = self.targets(obs, me, muzzle, hpf)  # no running off in the open: a laser hits a runner just the same
         aim, fire, reload = self.weapons(me, muzzle, tube, T, t)
-        if T and T["kind"] == "mech" and any(fire):
-            self.shot_t[T["id"]] = t
-        # In a fight: it's in sight and one of us shot at the other in the last 3 s (not just a mech far off in view).
-        engaged = bool(T and T["kind"] == "mech" and T["los"] and t - max(
-            self.hit_by.get(T["id"], -1e9), self.hit_on.get(T["id"], -1e9), self.shot_t.get(T["id"], -1e9)) < 3)
         if self.turn_to and t - self.turn_to[1] < 1.0 and not (T and T["kind"] == "mech" and T["los"] and T["id"] in self.hit_by
                                                               and t - self.hit_by[T["id"]] < 1.0):
-            aim = [self.turn_to[0], 0.0]  # hit by someone we can't see (or in the back, x1.5): turn to it now
+            aim = [self.turn_to[0], 0.0]  # hit in the back (x1.5) by someone we don't have in front of us: turn round now
             fire = [bool(w and w["kind"] == "laser" and w.get("charge", 0) > 0) for w in me["weapons"]]  # nothing leaves off-aim; a charge is held
 
         # Movement goal.
@@ -562,14 +533,13 @@ class Bot:
             move, mode = dodge
         elif not me["in_zone"]:
             mode = "zone"
-        elif not engaged:  # in a fight, loot and drops wait: hold the edge spot and strafe (walking straight gets us led)
+        else:
             drop = None
-            calm = hpf >= DROP_HP and (self.threat is None or t - self.threat[1] > DROP_CALM_S)
-            for dr in obs.get("drops", []) if calm else ():
+            for dr in obs.get("drops", []):
                 dd = d2(dr["pos"], pos)
                 if (dr["holder"] in (None, me["id"]) and dd < 250 and d2(dr["pos"], c) < r - 3
                         and dr["lands_in"] <= dd / st.get("walk_speed", 11.7) + 10
-                        and not any(d2(p, dr["pos"]) < DROP_CLEAR for p, _ in self.foes.values())):
+                        and not any(d2(m["pos"], dr["pos"]) < 60 for m in enemies)):
                     drop = dr
                     break
             loot = None if (near and d2(near["pos"], pos) < 70) or hpf < 0.35 else self.loot_goal(me, pos, c, r)
@@ -592,13 +562,10 @@ class Bot:
                 pull = min(gap / 6, 1.0)
                 to_spot = unit(goal[0] - x, goal[1] - y)
                 move = unit(math.cos(yaw) + to_spot[0] * pull, math.sin(yaw) + to_spot[1] * pull)
-            elif mode == "drop" and gap <= arrive:  # in the ring: circle it without a step sound; standing still is the easiest shot
-                tan = unit(goal[1] - y, x - goal[0])
-                move = [v * QUIET_MOVE for v in (tan if tan != [0.0, 0.0] else [1.0, 0.0])]
 
         # Stuck: commanded to move but not getting anywhere -> jump and jet; if that fails too, sidestep.
         # Not while fighting inside the zone (hopping about loses the fight); outside it the zone kills faster than they do.
-        fighting = engaged and me["in_zone"]  # boost only in a real fight: a mech merely in view isn't worth the energy and noise
+        fighting = bool(T and T["kind"] == "mech" and T["los"] and me["in_zone"])
         wants_move = math.hypot(*move) > 0.5
         self.hist = [h for h in self.hist if t - h[0] < 1.2] + [(t, x, y, wants_move)]
         h0 = self.hist[0]
@@ -609,8 +576,6 @@ class Bot:
             move = self.unstick_dir
         elif stuck:
             jump = me["grounded"] and not fighting
-            if jump:
-                self.hop_t = t
             if t - self.stuck_since > 2.5:
                 a = math.atan2(move[1], move[0]) + self.rng.choice((-1, 1)) * math.pi / 2
                 self.unstick_dir, self.unstick_until = [math.cos(a), math.sin(a)], t + 1.0
@@ -620,8 +585,6 @@ class Bot:
         if fighting:  # boost through the whole fight, walking just long enough to recharge (duel-tested; jets lost)
             self.burn = me["energy"] > 70 if not self.burn else me["energy"] > 25
             boost = boost or (self.burn and me["grounded"])
-        if not me["grounded"] and t - self.hop_t >= HOP_JET_S:
-            boost = False  # in the air, jet only just after a hop: enough to clear a ledge, not a climb up a wall
 
         # Where to look when there's nothing to shoot.
         if aim is None:
