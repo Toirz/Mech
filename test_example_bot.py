@@ -55,4 +55,16 @@ if os.path.isdir(arena):
             assert path and all(math.dist(p, q) < 9 for p, q in zip([a] + path, path)), "path steps are neighbor cells"
             reached += math.dist(path[-1], b) < 1
     assert reached > 0
+# Roaming heads for cells we haven't been to, inside the safe circle; hiding without a map stays put.
+from example_bot import Bot
+b = Bot.__new__(Bot)
+b.rng, b.world, b.visited, b.roam, b.roam_t = random.Random(2), None, {}, None, -1e9
+b.threat, b.cover, b.cover_t, b.mech = None, None, -1e9, {"height": 9}
+for x in range(-200, 1, 40):  # the west half is freshly visited
+    for y in range(-200, 201, 40):
+        b.visited[(x // 40, y // 40)] = 100.0
+g = b.roam_goal([0, 0, 0], [0, 0], 250, 100.0)
+assert g and math.hypot(*g) < 233 and g[0] > 0, g
+assert b.roam_goal([1, 1, 0], [0, 0], 250, 101.0) == g  # keeps its waypoint until there
+assert b.cover_spot([5, 6, 0], [0, 0], 250, [{"pos": [50, 0, 0]}], 0.0) == [5, 6]
 print("ok")

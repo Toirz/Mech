@@ -1,7 +1,8 @@
-"""Bot: hold the inside edge of the zone, fight with the right weapon for the range, dodge, loot, use the map to path and aim.
+"""Bot: roam the safe circle hunting lasers, cubes and supply drops; hide to heal when hurt; fight with the right weapon.
 
-Priorities each decision (movement): dodge a laser/shell > get back in the zone > flee when weak
-> capture a supply drop > grab nearby loot > hold the zone edge (strafing while fighting).
+Priorities each decision (movement): dodge a shell > get back in the zone > capture a supply drop
+> hide out of sight while HP < HIDE_HP (until HEALED_HP) > a laser in the first minute > loot
+> stand and strafe against a mech in a fight > roam to the least recently visited cell (scanning).
 """
 import math
 import random
@@ -13,7 +14,7 @@ from world import World
 EDGE_MARGIN = 12.0   # m to stay inside the zone edge
 LOOKAHEAD_S = 4.0    # aim for where the edge will be, so a shrinking zone doesn't catch us
 ARRIVED = 3.0        # m from a goal: stand still (silent, and HP regens)
-LOOT_RANGE = 90.0    # m: farthest we walk for a weapon or cube
+LOOT_RANGE = 200.0   # m: farthest we walk for a weapon or cube (roaming: we go looking)
 CUBE_KEEP = 15       # past this, cubes only make us bigger (stats cap at 10; 15 = one more upgrade)
 MORTAR_MIN = 20.0    # m: closer than this our own splash and knockback hurt us
 PATH_BUDGET = 0.01   # s of A* per decision (the whole decision must fit in 50 ms)
@@ -26,6 +27,11 @@ LATENCY = 0.03       # s from an observation to the shot leaving (the action app
 GUN_TOL = 1.0        # m: the gun fires only when its aim is this close to the lead point, at the target
 GUN_MIN_P = 0.15     # the gun holds fire below this estimated hit chance
 LASER_MARGIN = 0.8   # m: the beam must point this far inside the target's edge when we let go
+DROP_RANGE = 400.0   # m: farthest we go for a supply drop (3 cubes, full HP and energy)
+ROAM_CELL = 40.0     # m: cells of the visited map; roaming heads for the one we left longest ago
+ROAM_REPICK = 25.0   # s: give up on a roam waypoint after this
+HIDE_HP, HEALED_HP = 0.45, 0.9  # HP fraction: hide below the first, go back out at the second
+FIGHT_RANGE = 150.0  # m: a seen mech this close (or one shooting us) stops the roam: stand and strafe
 DEBUG = bool(__import__("os").environ.get("BOT_DEBUG"))
 # Upgrade order, one entry per stack; with lightning in hand its two upgrades come right after laser_charge.
 UPGRADE_PLAN = ["plating", "laser_damage", "nanites", "plating", "laser_damage", "laser_charge", "plating", "armor",
@@ -142,6 +148,8 @@ class Bot:
         self.bad_pickups = {}            # id -> t until we stop trying it
         self.hit_by, self.hit_on = {}, {}  # id -> last time it damaged us / we damaged it
         self.dbg = {}
+        self.visited, self.roam, self.roam_t = {}, None, -1e9  # cell -> last t there; current waypoint
+        self.hiding, self.cover, self.cover_t = False, None, -1e9
         self.pred = Predictor(self.mech.get("gravity", 22), self.world.ground_at if self.world else None)
 
     # ----- memory -----
@@ -450,6 +458,63 @@ class Bot:
                     return p
         return spot
 
+    def roam_goal(self, pos, c, r, t):
+        """A walkable waypoint inside the safe circle, in the cell we have been away from longest
+        (unvisited first, then nearest), so we sweep the map for loot instead of holding the edge."""
+        self.visited[(int(pos[0] // ROAM_CELL), int(pos[1] // ROAM_CELL))] = t
+        rr = max(r - EDGE_MARGIN - 5, 0.0)
+        g = self.roam
+        if g and d2(g, pos) > 8 and t - self.roam_t < ROAM_REPICK and d2(g, c) < rr:
+            return g
+        best, bs = None, None
+        for _ in range(32):
+            a, k = self.rng.uniform(0, 2 * math.pi), math.sqrt(self.rng.random())
+            p = [c[0] + math.cos(a) * rr * k, c[1] + math.sin(a) * rr * k]
+            if self.world:
+                p = self.world.clamp(p, MAP_MARGIN)
+                if not self.world.free(*p):
+                    continue
+            if d2(p, c) >= rr or d2(p, pos) < 30:
+                continue
+            s = self.visited.get((int(p[0] // ROAM_CELL), int(p[1] // ROAM_CELL)), -300.0) + d2(p, pos) / 10  # 10 m ~ 1 s
+            if bs is None or s < bs:
+                best, bs = p, s
+        self.roam, self.roam_t = best, t
+        return best
+
+    def cover_spot(self, pos, c, r, enemies, t):
+        """A walkable spot within 40 m, inside the safe circle, out of sight of every known enemy (and of a
+        shooter we only felt, assumed 80 m out along the hit's bearing). Our own spot if nobody is known."""
+        eye = self.mech.get("eye_height", 8.0)
+        ws = sorted(enemies, key=lambda m: d2(m["pos"], pos))[:4]
+        watchers = [[m["pos"][0], m["pos"][1], m["pos"][2] + eye] for m in ws]
+        if self.threat and t - self.threat[1] < 5:
+            b = self.threat[0]
+            watchers.append([pos[0] + 80 * math.cos(b), pos[1] + 80 * math.sin(b), pos[2] + eye])
+        if not watchers or not self.world:
+            return list(pos[:2])
+        mid = self.mech["height"] / 2
+
+        def hidden(p):
+            q = [p[0], p[1], self.world.ground_at(p[0], p[1]) + mid]
+            return not any(self.los(w, q) for w in watchers)
+        if t - self.cover_t < 1.0:  # the search costs line-of-sight rays: redo it once a second (None included)
+            return self.cover
+        if self.cover and hidden(self.cover):
+            self.cover_t = t
+            return self.cover
+        rr = max(r - EDGE_MARGIN, 0.0)
+        for dist in (0, 8, 16, 28, 40):
+            for i in range(12 if dist else 1):
+                a = i * math.pi / 6
+                p = [pos[0] + dist * math.cos(a), pos[1] + dist * math.sin(a)]
+                if (d2(p, c) < rr and self.world.free(*p) and hidden(p)
+                        and all(d2(m["pos"], p) > d2(m["pos"], pos) - 5 for m in ws)):  # not toward them
+                    self.cover, self.cover_t = p, t
+                    return p
+        self.cover, self.cover_t = None, t
+        return None
+
     def steer(self, pos, goal, t, force=False):
         """Unit move vector toward goal along an A* path."""
         if not self.world:
@@ -523,6 +588,14 @@ class Bot:
             aim = [self.turn_to[0], 0.0]  # hit in the back (x1.5) by someone we don't have in front of us: turn round now
             fire = [bool(w and w["kind"] == "laser" and w.get("charge", 0) > 0) for w in me["weapons"]]  # nothing leaves off-aim; a charge is held
 
+        if hpf < HIDE_HP:
+            self.hiding = True
+        elif hpf >= HEALED_HP:
+            self.hiding = False
+        if self.hiding and not (T and T["kind"] == "mech" and (t - self.hit_by.get(T["id"], -1e9) < 5 or T["d"] < 40)):
+            # regen needs 5 s without dealing damage too: shoot only whoever is on us; a charge is held
+            fire = [bool(w and w["kind"] == "laser" and w.get("charge", 0) > 0) for w in me["weapons"]]
+
         # Movement goal.
         c, r = zone_at(obs["zone"], t + LOOKAHEAD_S)
         spot = self.free_edge_spot(pos, c, r)
@@ -537,7 +610,7 @@ class Bot:
             drop = None
             for dr in obs.get("drops", []):
                 dd = d2(dr["pos"], pos)
-                if (dr["holder"] in (None, me["id"]) and dd < 250 and d2(dr["pos"], c) < r - 3
+                if (dr["holder"] in (None, me["id"]) and dd < DROP_RANGE and d2(dr["pos"], c) < r - 3
                         and dr["lands_in"] <= dd / st.get("walk_speed", 11.7) + 10
                         and not any(d2(m["pos"], dr["pos"]) < 60 for m in enemies)):
                     drop = dr
@@ -545,17 +618,28 @@ class Bot:
             loot = None if (near and d2(near["pos"], pos) < 70) or hpf < 0.35 else self.loot_goal(me, pos, c, r)
             shot_at = self.threat is not None and t - self.threat[1] < 3
             early = self.early_laser(me, pos, enemies) if t < EARLY_S and not shot_at else None
-            if early:
-                goal, mode, arrive = early, "laser", 1.0
-            elif drop:
+            engaged = bool(T and T["kind"] == "mech" and T["los"]
+                           and (T["d"] < FIGHT_RANGE or t - self.hit_by.get(T["id"], -1e9) < 3))
+            hide = self.cover_spot(pos, c, r, enemies, t) if self.hiding and not drop else None
+            if drop:
                 goal, mode, arrive = drop["pos"], "drop", max(drop["radius"] - 3, 1.0)
+            elif hide:
+                goal, mode, arrive = hide, "hide", 1.5
+            elif early:
+                goal, mode, arrive = early, "laser", 1.0
             elif loot:
                 goal, mode, arrive = loot, "loot", 1.0
+            elif engaged:
+                goal, mode = list(pos[:2]), "fight"  # stand and trade, strafing (running off loses fights)
+            else:
+                roam = self.roam_goal(pos, c, r, t)
+                if roam:
+                    goal, mode, arrive = roam, "roam", 6.0
 
         gap = d2(goal, pos)
         if move is None:
             move = self.steer(pos, goal, t, force=self.stuck_since is not None and t - self.stuck_since > 1) if gap > arrive else [0.0, 0.0]
-            if mode == "edge" and T and T["kind"] == "mech" and T["los"]:  # strafe across their line of fire
+            if mode in ("edge", "fight") and T and T["kind"] == "mech" and T["los"]:  # strafe across their line of fire
                 if t >= self.strafe_until:
                     self.strafe_sign, self.strafe_until = -self.strafe_sign, t + self.rng.uniform(0.35, 0.9)  # reverse before their led shot lands
                 yaw = math.atan2(T["pos"][1] - y, T["pos"][0] - x) + self.strafe_sign * math.pi / 2
@@ -595,6 +679,8 @@ class Bot:
                 aim = [self.threat[0], 0.0]
             elif self.heard and t - self.heard[1] < 2:
                 aim = [self.heard[0], 0.0]
+            elif mode == "roam" and wants_move:  # scan: sweep +-1 rad across the way we walk
+                aim = [math.atan2(move[1], move[0]) + math.sin(t * 2.0), 0.0]
             elif gap > 30 and wants_move:
                 aim = [math.atan2(move[1], move[0]), 0.0]
             else:
