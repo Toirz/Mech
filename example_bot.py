@@ -274,7 +274,9 @@ class Bot:
             m = x["m"]
             away = abs(ang_diff(m["aim"][0], math.atan2(muzzle[1] - x["pos"][1], muzzle[0] - x["pos"][0]))) > math.pi / 2
             hp = m.get("hp", 1) / max(m.get("max_hp", 1), 1)
-            return (x["d"] / 100 + hp * 1.5 + (0 if x["los"] else 1.5) - 0.8 * away - 0.4 * (x["id"] in busy)
+            return (x["d"] / 100 + hp * 1.5 + (0 if x["los"] else 1.5) - 0.8 * away - 0.8 * (x["id"] in busy)
+                    - 0.4 * (away and m.get("charging", False))  # its laser is on someone else: it can't answer us in time
+                    - 0.5 * (self.t - self.hit_on.get(x["id"], -1e9) < 2)  # keep on the one we are hurting
                     - 1.0 * (self.t - self.hit_by.get(x["id"], -1e9) < 3))  # whoever is shooting us first
 
         mechs = sorted((x for x in mechs if x["d"] < 300), key=lambda x: x["d"])[:6]
