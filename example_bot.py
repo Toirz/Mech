@@ -19,11 +19,15 @@ MORTAR_MIN = 20.0    # m: closer than this our own splash and knockback hurt us
 PATH_BUDGET = 0.01   # s of A* per decision (the whole decision must fit in 50 ms)
 MECH_SOUNDS = {"gun", "mortar", "laser", "laser_charge", "lightning", "step", "boost", "reload", "jet"}
 SOUND_DIST = {"near": 45.0, "mid": 110.0}
-BEATS = {"laser": "mortar", "mortar": "lightning", "lightning": "laser"}
-WEAPON_VALUE = {"laser": 1.0, "mortar": 0.8, "lightning": 0.6, "gun": 0.5}
-UPGRADE_RANK = ["armor", "plating", "nanites", "laser_damage", "gun_damage", "gun_rate", "laser_charge", "sensors",
-                "servos", "gyros", "gun_mag", "gun_velocity", "lightning_efficiency", "mortar_reload", "lightning_range",
-                "capacitor", "reactor", "jets", "mortar_velocity", "mortar_splash", "lightning_chain", "laser_pierce"]
+WEAPON_VALUE = {"laser": 1.0, "lightning": 0.7, "gun": 0.5}  # never a mortar: a laser hit on its carrier cooks off (+60%)
+EARLY_S, EARLY_RANGE = 60.0, 250.0  # the first minute: walk this far for a laser (else a lightning)
+GUN_OPEN = 100.0     # m: the gun doesn't start a fight with a mech farther than this (it joins one at any range)
+# Upgrade order, one entry per stack; with lightning in hand its two upgrades come right after laser_charge.
+UPGRADE_PLAN = ["plating", "laser_damage", "nanites", "plating", "laser_damage", "laser_charge", "plating", "armor",
+                "gun_damage", "gun_rate", "sensors", "armor", "gyros"]
+UPGRADE_REST = ["armor", "nanites", "laser_charge", "laser_damage", "gun_damage", "gun_rate", "servos", "gyros", "sensors",
+                "gun_mag", "gun_velocity", "lightning_efficiency", "lightning_range", "lightning_chain", "capacitor",
+                "reactor", "jets", "laser_pierce"]
 
 
 # ---------- geometry (pure, tested in test_example_bot.py) ----------
@@ -127,16 +131,13 @@ class Bot:
         self.burn = True  # boosting in a fight: on until energy drops to 25, back on at 70
         self.vhist = {}  # target id -> [(t, its velocity)] over the last 2 s
         self.short_until = 0.0
-        self.seen_weapons = {}           # mech id -> weapons it was seen holding
         self.pickups = {}                # id -> (kind, pos, t seen)
         self.cubes = {}                  # id -> (pos, t seen)
         self.bad_pickups = {}            # id -> t until we stop trying it
+        self.hit_by, self.hit_on = {}, {}  # id -> last time it damaged us / we damaged it
 
     # ----- memory -----
     def remember(self, obs, t, pos):
-        for m in obs["mechs"]:
-            if m["kind"] == "mech" and m.get("weapons"):
-                self.seen_weapons[m["id"]] = m["weapons"]
         for p in obs["pickups"]:
             self.pickups[p["id"]] = (p["kind"], p["pos"], t)
         for c in obs["cubes"]:
@@ -150,6 +151,10 @@ class Bot:
         for e in obs["events"]:
             if e["type"] == "damaged" and e.get("bearing") is not None:
                 self.threat = (e["bearing"], t)
+                if e.get("by") is not None:
+                    self.hit_by[e["by"]] = t
+            elif e["type"] == "hit":
+                self.hit_on[e["target"]] = t
             elif e["type"] == "take_failed":
                 self.bad_pickups[e["id"]] = t + 5
                 if e["reason"] == "gone":
@@ -167,25 +172,18 @@ class Bot:
         return self.world.clear(a, b) if self.world else True
 
     # ----- weapons -----
-    def weapon_value(self, kind):
-        v = WEAPON_VALUE.get(kind, 0)
-        for ws in self.seen_weapons.values():
-            for w in ws:
-                v += 0.15 * ((BEATS.get(kind) == w) - (BEATS.get(w) == kind))
-        return v
-
     def wants(self, kind, me):
-        """Is a pickup of this kind worth taking, and into which slot (drop) if both are full?"""
+        """Is a pickup of this kind worth taking, and into which slot (drop) if both are full? Aim: gun + laser."""
         ws = me["weapons"]
-        if kind == "gun" or any(w and w["kind"] == kind for w in ws):
+        if kind not in WEAPON_VALUE or kind == "gun" or any(w and w["kind"] == kind for w in ws):
             return False, None
         if None in ws:
             return True, None
         swap = [i for i, w in enumerate(ws) if w["kind"] != "gun" and not w.get("charge")]
         if not swap:
             return False, None
-        i = min(swap, key=lambda i: self.weapon_value(ws[i]["kind"]))
-        return self.weapon_value(kind) > self.weapon_value(ws[i]["kind"]) + 0.3, i
+        i = min(swap, key=lambda i: WEAPON_VALUE.get(ws[i]["kind"], 0))
+        return WEAPON_VALUE[kind] > WEAPON_VALUE.get(ws[i]["kind"], 0) + 0.2, i  # a laser replaces a lightning
 
     def targets(self, obs, me, muzzle, hpf, fleeing):
         """The best thing to shoot: a mech, else (when healthy and calm) an NPC drone or a crate."""
@@ -217,6 +215,10 @@ class Bot:
         mechs = sorted((x for x in mechs if x["d"] < 300), key=lambda x: x["d"])[:6]
         for x in mechs:
             x["los"] = self.los(muzzle, x["c"])
+        npc = next((x for x in others if x["kind"] == "npc" and self.t - self.hit_by.get(x["id"], -1e9) < 3), None)
+        if npc and not any(self.t - self.hit_by.get(x["id"], -1e9) < 3 for x in mechs):  # a drone is shooting us: answer it
+            npc["los"] = self.los(muzzle, npc["c"])
+            return npc
         if mechs:
             return min(mechs, key=score)
         if fleeing or hpf < 0.6:
@@ -247,7 +249,9 @@ class Bot:
                 if k == "gun":
                     p = lead(muzzle, T["c"], T["vel"], st["speed"])
                     aims[i] = aim_at(muzzle, [T["c"][j] + (p[j] - T["c"][j]) * 0.8 for j in range(3)])  # strafers reverse: 80% of the lead hits most (duel-tested)
-                    ok[i] = T["los"] and T["d"] <= st["range"] and w.get("ammo", 1) > 0 and not w.get("reload")
+                    joined = T["kind"] != "mech" or t - max(self.hit_by.get(T["id"], -1e9), self.hit_on.get(T["id"], -1e9)) < 5
+                    ok[i] = (T["los"] and T["d"] <= (st["range"] if joined else GUN_OPEN) and w.get("ammo", 1) > 0
+                             and not w.get("reload"))  # the gun misses a lot far off and its noise carries 320 m
                     tol[i] = size + 0.006
                 elif k == "laser":
                     aims[i] = aim_at(muzzle, T["c"])
@@ -307,6 +311,33 @@ class Bot:
         calm = T is None or T["kind"] != "mech"
         reload = bool(gun) and not gun.get("reload") and (gun.get("ammo", 1) == 0 or (calm and gun.get("ammo", 0) < gun["stats"]["mag"] / 2))
         return aim, fire, reload
+
+    def pick_upgrade(self, ids, me):
+        """Index of the offer to take: the earliest next stack in UPGRADE_PLAN, then UPGRADE_REST; never a mortar one."""
+        plan = list(UPGRADE_PLAN)
+        if any(w and w["kind"] == "lightning" for w in me["weapons"]):
+            k = plan.index("laser_charge") + 1
+            plan[k:k] = ["lightning_efficiency", "lightning_range"]
+        taken = me.get("upgrades") or []
+
+        def rank(u):
+            if u.startswith("mortar"):
+                return 1e9
+            spots = [i for i, v in enumerate(plan) if v == u]
+            n = taken.count(u)
+            return spots[n] if n < len(spots) else len(plan) + (UPGRADE_REST.index(u) if u in UPGRADE_REST else 99)
+        return min(range(len(ids)), key=lambda i: rank(ids[i]))
+
+    def early_laser(self, me, pos, enemies):
+        """In the first minute: the nearest laser seen within EARLY_RANGE (else a lightning) we want and can reach first."""
+        for kind in ("laser", "lightning"):
+            best = min(((d2(p, pos), p) for pid, (k, p, _) in self.pickups.items()
+                        if k == kind and self.bad_pickups.get(pid, -1) < self.t and self.wants(k, me)[0]
+                        and d2(p, pos) < EARLY_RANGE and abs(p[2] - pos[2]) < 4  # not on a roof
+                        and not any(d2(m["pos"], p) < d2(p, pos) for m in enemies)), default=None)  # nobody closer to it
+            if best:
+                return best[1]
+        return None
 
     # ----- movement -----
     def dodge(self, obs, me, pos):
@@ -385,8 +416,7 @@ class Bot:
         tube = [x, y, z + st.get("height", self.mech["height"]) + 0.5]
 
         if obs["offer"]:
-            ids = [ch["id"] for ch in obs["offer"]["choices"]]
-            act["pick"] = min(range(len(ids)), key=lambda i: UPGRADE_RANK.index(ids[i]) if ids[i] in UPGRADE_RANK else 99)
+            act["pick"] = self.pick_upgrade([ch["id"] for ch in obs["offer"]["choices"]], me)
 
         # Take a wanted weapon within reach (swap out the weakest non-gun if both slots are full).
         reach = self.cfg["loot"]["pickup_radius"] - 0.3
@@ -398,6 +428,10 @@ class Bot:
                     if slot is not None:
                         act["drop"] = slot
                     break
+        if "drop" not in act:  # a mortar in hand only gets us cooked off: leave it
+            junk = next((i for i, w in enumerate(me["weapons"]) if w and w["kind"] == "mortar"), None)
+            if junk is not None:
+                act["drop"] = junk
 
         # Who is dangerous, and should we run?
         enemies = [m for m in obs["mechs"] if m["kind"] == "mech"]
@@ -434,7 +468,11 @@ class Bot:
                     drop = dr
                     break
             loot = None if (near and d2(near["pos"], pos) < 70) or hpf < 0.35 else self.loot_goal(me, pos, c, r)
-            if drop:
+            shot_at = self.threat is not None and t - self.threat[1] < 3
+            early = self.early_laser(me, pos, enemies) if t < EARLY_S and not shot_at else None
+            if early:
+                goal, mode, arrive = early, "laser", 1.0
+            elif drop:
                 goal, mode, arrive = drop["pos"], "drop", max(drop["radius"] - 3, 1.0)
             elif loot:
                 goal, mode, arrive = loot, "loot", 1.0
@@ -476,7 +514,9 @@ class Bot:
         # Where to look when there's nothing to shoot.
         if aim is None:
             inward = math.atan2(c[1] - y, c[0] - x)
-            if self.threat and t - self.threat[1] < 3:  # turn to face whoever hit us
+            if t < 1.6:  # a full turn at spawn (turn_rate 4 rad/s): see the loot behind us too
+                aim = [me["aim"][0] + 1.0, 0.0]
+            elif self.threat and t - self.threat[1] < 3:  # turn to face whoever hit us
                 aim = [self.threat[0], 0.0]
             elif self.heard and t - self.heard[1] < 2:
                 aim = [self.heard[0], 0.0]
