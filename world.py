@@ -140,7 +140,12 @@ class World:
         return [self.x0 + (c % self.mnx + 0.5) * s, self.y0 + (c // self.mnx + 0.5) * s]
 
     def free(self, x, y):
-        return self.cost[self.nav_cell(x, y)] <= 1.0
+        I, J = int((x - self.x0) // (CELL * NAV)), int((y - self.y0) // (CELL * NAV))
+        return 0 <= I < self.mnx and 0 <= J < self.mny and self.cost[J * self.mnx + I] <= 1.0  # off the map is not walkable
+
+    def clamp(self, p, m):
+        """p moved at least m inside the map edge (the edge is a wall)."""
+        return [min(max(p[0], self.x0 + m), self.x0 + self.nx * CELL - m), min(max(p[1], self.y0 + m), self.y0 + self.ny * CELL - m)]
 
     def line_free(self, a, b):
         n = int(math.dist(a[:2], b[:2]) / CELL) + 1
