@@ -409,29 +409,8 @@ class Bot:
         eye = near and [near["pos"][0], near["pos"][1], near["pos"][2] + self.mech["eye_height"]]
         return min(goals, key=lambda g: (bool(eye) and self.los(eye, [g[0], g[1], z + 4.5]), -d2(g, foe)))
 
-    def fight_spot(self, me, pos, T, goal, arrive, c, r, safe_r):
-        """Where to stand against T: in arc range when our lightning is winning, on top of a nearly dead one,
-        out of their arc when our laser faces lightning. Otherwise the edge spot."""
-        kinds, theirs = {w["kind"] for w in me["weapons"] if w}, T["m"].get("weapons", [])
-        hp_t = T["m"].get("hp", 1e9) / max(T["m"].get("max_hp", 1), 1)
-        hpf = me["hp"] / max(me["max_hp"], 1)
-        d = d2(T["pos"], pos)
-        if "lightning" in kinds and me["energy"] > 30 and hpf >= hp_t and "mortar" not in theirs and d < 120:
-            want = self.cfg["weapons"]["lightning"]["range"] * 0.7  # (a mortar's knockback would keep us out of range)
-        elif hp_t < 0.25 and hpf > 0.5 and d < 150:
-            want = 30.0
-        elif "laser" in kinds and "lightning" in theirs and d < 60:
-            want = 70.0
-        else:
-            return goal, arrive
-        u = unit(pos[0] - T["pos"][0], pos[1] - T["pos"][1])
-        g = [T["pos"][0] + u[0] * want, T["pos"][1] + u[1] * want]
-        if d2(g, c) > safe_r:
-            g = edge_spot(g, c, r, EDGE_MARGIN)
-        return (self.world.clamp(g, MAP_MARGIN) if self.world else g), 3.0
-
     def loot_goal(self, me, pos, c, r):
-        best, bd = None, LOOT_RANGE * (2 if None in me["weapons"] else 1)  # an empty slot is worth a longer walk
+        best, bd = None, LOOT_RANGE
         for pid, (kind, p, _) in self.pickups.items():
             if (self.bad_pickups.get(pid, -1) < self.t and self.wants(kind, me)[0] and d2(p, c) < r - 6 and d2(p, pos) < bd
                     and abs(p[2] - pos[2]) < 4):  # not up on a roof
@@ -480,9 +459,8 @@ class Bot:
         if foe is None and recent_hit:  # hit by something we can't see: it's that way
             foe = [x + math.cos(self.threat[0]) * 100, y + math.sin(self.threat[0]) * 100]
         stronger = near is not None and near.get("hp", 0) > 1.5 * me["hp"] and near.get("cubes", 0) >= me["cubes"] + 3
-        dying = near is not None and near.get("hp", 1e9) < 0.5 * me["hp"]  # finish it instead of running
         fleeing = self.fleeing = (foe is not None and d2(foe, pos) < (FLEE_KEEP if self.fleeing else FLEE_DIST)
-                                  and (hpf < FLEE_HP or stronger) and not dying)
+                                  and (hpf < FLEE_HP or stronger))
         T = self.targets(obs, me, muzzle, hpf, fleeing)
         self.last_target = T["id"] if T else None
         aim, fire, reload = self.weapons(me, muzzle, tube, T, fleeing, recent_hit, t)
@@ -500,20 +478,20 @@ class Bot:
         elif fleeing:
             goal, mode = self.flee_goal(pos, foe, near, c, r, safe_r), "flee"
         else:
-            drops = [dr for dr in obs.get("drops", [])
-                     if dr["holder"] in (None, me["id"]) and d2(dr["pos"], pos) < 250 and d2(dr["pos"], c) < r - 3
-                     and dr["lands_in"] <= d2(dr["pos"], pos) / st.get("walk_speed", 11.7) + 10
-                     and (dr["holder"] == me["id"]  # already capturing: finish it
-                          or not any(d2(m["pos"], dr["pos"]) < 60 and m.get("hp", 1e9) > 0.7 * me["hp"] for m in enemies))]
-            drop = min(drops, key=lambda dr: d2(dr["pos"], pos), default=None)
+            drop = None
+            for dr in obs.get("drops", []):
+                dd = d2(dr["pos"], pos)
+                if (dr["holder"] in (None, me["id"]) and dd < 250 and d2(dr["pos"], c) < r - 3
+                        and dr["lands_in"] <= dd / st.get("walk_speed", 11.7) + 10
+                        and not any(d2(m["pos"], dr["pos"]) < 60 for m in enemies)):
+                    drop = dr
+                    break
             loot = None if (near and d2(near["pos"], pos) < 70) or hpf < 0.5 else self.loot_goal(me, pos, c, r)
             if drop:
                 goal, mode, arrive = drop["pos"], "drop", max(drop["radius"] - 3, 1.0)
             elif loot:
                 goal, mode, arrive = loot, "loot", 1.0
 
-        if mode == "edge" and T and T["kind"] == "mech" and T["los"]:
-            goal, arrive = self.fight_spot(me, pos, T, goal, arrive, c, r, safe_r)
         gap = d2(goal, pos)
         strafing = False
         if move is None:
@@ -559,7 +537,7 @@ class Bot:
             elif gap > 30 and wants_move:
                 aim = [math.atan2(move[1], move[0]), 0.0]
             else:
-                aim = [inward + math.sin(t * 0.8), 0.0]  # sweep +-57 deg around inward: enemies come from inside, not only
+                aim = [inward, 0.0]  # back to the zone edge: enemies come from inside
 
         act.update(move=move, boost=boost, jump=jump, aim=aim, fire=fire, reload=reload)
         self.draw(pos, muzzle, goal, T, mode, me)
