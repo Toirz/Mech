@@ -8,6 +8,7 @@ import random
 import time
 
 import mechfight as mf
+from predict import Predictor
 from world import World
 
 EDGE_MARGIN = 12.0   # m to stay inside the zone edge
@@ -34,6 +35,11 @@ FLANK_D = (50.0, 110.0)  # m behind it we go to
 COVER_NEAR = 30.0    # m: losing a fight, fall back to cover only this close (farther, stand and fight)
 PEEK_S = 1.5         # s out of cover for one shot before stepping back
 AMBUSH_S = 1.0       # s: a foe about to come round the corner this soon finds our laser charged and waiting
+LATENCY = 0.03       # s from an observation to the shot leaving (the action applies on the next ticks)
+GUN_TOL = 1.0        # m: the gun fires only when its aim is this close to the lead point, at the target
+GUN_MIN_P = 0.15     # the gun holds fire below this estimated hit chance
+LASER_MARGIN = 0.8   # m: the beam must point this far inside the target's edge when we let go
+DEBUG = bool(__import__("os").environ.get("BOT_DEBUG"))
 # Upgrade order, one entry per stack; with lightning in hand its two upgrades come right after laser_charge.
 UPGRADE_PLAN = ["plating", "laser_damage", "nanites", "plating", "laser_damage", "laser_charge", "plating", "armor",
                 "gun_damage", "gun_rate", "sensors", "armor", "gyros"]
@@ -164,6 +170,8 @@ class Bot:
         self.flank_from = None           # (mech id, t) we started working round
         self.hide = None                 # (spot [x, y], t chosen): out of sight of whoever we're losing to
         self.peek_until, self.next_peek, self.peek_from, self.peek_charged = -1.0, 0.0, None, False
+        self.dbg = {}
+        self.pred = Predictor(self.mech.get("gravity", 22), self.world.ground_at if self.world else None)
 
     # ----- memory -----
     def remember(self, obs, t, pos):
@@ -380,9 +388,15 @@ class Bot:
         return None
 
     def weapons(self, me, muzzle, tube, T, t, precharge=False):
-        """(aim or None, fire[2], reload). precharge: start the laser behind cover, with no line to T yet."""
+        """(aim or None, fire[2], reload). precharge: start the laser behind cover, with no line to T yet.
+
+        Each weapon gets its own aim point from the motion predictor: the gun leads by its flight time,
+        the laser and lightning by the decision latency. One torso serves all of them, so it follows the
+        gun's lead while a laser charges and swings to the laser's point just before letting go (at
+        4 rad/s the swing takes a tick). Shots are gated in meters at the target, not in angle, and the
+        gun only fires down a corridor that is clear around its actual path."""
         ws, now = me["weapons"], me["aim"]
-        aims, ok, tol = [None, None], [False, False], [0.0, 0.0]
+        aims, ok, dists = [None, None], [False, False], [1.0, 1.0]
         if T:
             h = self.vhist.setdefault(T["id"], [])
             h[:] = [e for e in h if t - e[0] < 2.0] + [(t, T["vel"])]
@@ -394,22 +408,24 @@ class Bot:
                 if not w:
                     continue
                 k, st = w["kind"], w["stats"]
-                size = math.atan2(T["r"], T["d"])
                 if k == "gun":
-                    p = lead(muzzle, T["c"], T["vel"], st["speed"])
-                    aims[i] = aim_at(muzzle, [T["c"][j] + (p[j] - T["c"][j]) * 0.8 for j in range(3)])  # strafers reverse: 80% of the lead hits most (duel-tested)
+                    pt, p_hit = self._gun_dbg = self.gun_point(muzzle, T, w)
                     joined = T["kind"] != "mech" or t - max(self.hit_by.get(T["id"], -1e9), self.hit_on.get(T["id"], -1e9)) < 5 or T.get("fight", False)
-                    ok[i] = (T["los"] and T["d"] <= (st["range"] if joined else GUN_OPEN) and w.get("ammo", 1) > 0
-                             and not w.get("reload"))  # the gun misses a lot far off and its noise carries 320 m
-                    tol[i] = size + 0.006
+                    if pt:
+                        aims[i], dists[i] = aim_at(muzzle, pt), math.dist(muzzle, pt)
+                    ok[i] = (pt is not None and T["los"] and T["d"] <= (st["range"] if joined else GUN_OPEN) and w.get("ammo", 1) > 0
+                             and not w.get("reload") and p_hit >= GUN_MIN_P)  # the gun misses a lot far off and its noise carries 320 m
                 elif k == "laser":
-                    aims[i] = aim_at(muzzle, T["c"])
-                    ok[i] = T["los"] and T["d"] <= st["range"] and t >= self.short_until
-                    tol[i] = size + 0.004
+                    pt = self.beam_point(muzzle, T)
+                    if pt:
+                        aims[i], dists[i] = aim_at(muzzle, pt), math.dist(muzzle, pt)
+                    else:
+                        aims[i] = aim_at(muzzle, T["c"])
+                    ok[i] = pt is not None and T["los"] and T["d"] <= st["range"] and t >= self.short_until
                 elif k == "lightning":
-                    aims[i] = aim_at(muzzle, T["c"])
-                    ok[i] = T["los"] and T["d"] <= st["range"] * 0.95 and me["energy"] >= st["energy"] + 5
-                    tol[i] = math.radians(st["cone_deg"]) / 2 * 0.7
+                    pt = self.point_at(T, LATENCY, T["c"][2] - T["pos"][2])
+                    aims[i], dists[i] = aim_at(muzzle, pt), math.dist(muzzle, pt)
+                    ok[i] = T["los"] and dists[i] <= st["range"] * 0.95 and me["energy"] >= st["energy"] + 5
                 elif k == "mortar":
                     # lead by its mean velocity over 2 s: a strafer's shell lands on the middle of its dance (aim-range tested)
                     sol = mortar_aim(tube, [T["pos"][0], T["pos"][1], T["pos"][2] + 0.5], vavg(2.0), st["speed"],
@@ -417,7 +433,7 @@ class Bot:
                     if sol:
                         aims[i] = sol[0]
                     ok[i] = sol is not None and d2(T["pos"], muzzle) >= MORTAR_MIN
-                    tol[i] = math.atan2(3, T["d"]) + 0.01
+                    dists[i] = T["d"]
 
         if T and T["kind"] == "mech":  # only the weapons targets() opened on it (none: just watch it)
             ok = [ok[i] and bool(ws[i]) and ws[i]["kind"] in T["open"] for i in range(2)]
@@ -425,44 +441,107 @@ class Bot:
         def ready(i):
             return ok[i] and ws[i]["cooldown"] <= 0.3
 
-        def pick(kinds):
-            for k in kinds:
-                for i, w in enumerate(ws):
-                    if w and w["kind"] == k and ready(i):
-                        return i
-            return None
-
-        charging = next((i for i, w in enumerate(ws) if w and w["kind"] == "laser" and w.get("charge", 0) > 0), None)
-        if charging is not None and aims[charging]:
-            p = charging
+        def slot(kind):
+            return next((i for i, w in enumerate(ws) if w and w["kind"] == kind), None)
+        g, la, li, mo = slot("gun"), slot("laser"), slot("lightning"), slot("mortar")
+        charging = la is not None and ws[la].get("charge", 0) > 0
+        if charging:  # follow the gun's lead while it charges; on its point for the last 0.15 s and after
+            full = ws[la]["charge"] >= ws[la]["stats"]["charge"] - 0.15
+            p = la if (full or g is None or not ready(g)) and aims[la] else g if g is not None and ready(g) else la
         elif T and not T["los"]:
-            p = pick(["mortar"])
+            p = mo if mo is not None and ready(mo) else None
         else:
-            p = pick(["laser", "lightning", "gun", "mortar"])
+            p = next((i for i in (g, la, li, mo) if i is not None and ready(i)), None)
         if p is None and T:
-            p = next((i for i, w in enumerate(ws) if w and w["kind"] == "gun" and aims[i]), None)
-            p = p if p is not None else next((i for i in (0, 1) if aims[i]), None)
+            p = g if g is not None and aims[g] else next((i for i in (0, 1) if aims[i]), None)
         aim = aims[p] if p is not None else None
 
+        # Where the torso will point when the shots leave: it slews toward `aim` first (turn_rate per tick).
+        dt = 1.0 / self.cfg["match"].get("tick_hz", 20)
+        st_ = me["stats"]
+        then = now
+        if aim is not None:
+            then = [now[0] + max(-st_.get("turn_rate", 4) * dt, min(st_.get("turn_rate", 4) * dt, ang_diff(aim[0], now[0]))),
+                    now[1] + max(-st_.get("pitch_rate", 3) * dt, min(st_.get("pitch_rate", 3) * dt, aim[1] - now[1]))]
         fire = [False, False]
         for i, w in enumerate(ws):
+            if w and aims[i] is None and w["kind"] == "laser" and w.get("charge", 0) > 0:
+                fire[i] = True  # no target in sight: keep the charge (letting go would fire it into nothing)
             if not w or aims[i] is None:
                 continue
             k, err = w["kind"], aim_error(now, aims[i])
+            off = err * dists[i]  # meters off the aim point, at the target
             if k == "laser":
                 if w.get("charge", 0) > 0:  # hold until full and on target, then let go (it fires on release)
                     full = w["charge"] >= w["stats"]["charge"] - 0.05
-                    fire[i] = not (full and err < tol[i] and ok[i])
-                else:
-                    fire[i] = (ok[i] and err < 0.35 or precharge and t >= self.short_until) and w["cooldown"] <= 0
+                    on = aim_error(then, aims[i]) * dists[i] < T["r"] - LASER_MARGIN and off < T["r"] + 1.0
+                    fire[i] = not (full and ok[i] and on)
+                else:  # start only if it will still be in the open when the charge is full (or behind cover, to peek)
+                    fire[i] = w["cooldown"] <= 0 and (
+                        ok[i] and err < 0.35 and self.los(muzzle, self.point_at(T, w["stats"]["charge"], T["c"][2] - T["pos"][2]))
+                        or precharge and t >= self.short_until)
             elif k == "lightning":
-                fire[i] = ok[i] and w["cooldown"] <= 0.1 and abs(ang_diff(now[0], aims[i][0])) < tol[i]
+                fire[i] = ok[i] and w["cooldown"] <= 0.1 and abs(ang_diff(now[0], aims[i][0])) < math.radians(w["stats"]["cone_deg"]) / 2 * 0.8
+            elif k == "gun":  # on the lead point once the torso has slewed, and not wildly off now
+                fire[i] = ok[i] and w["cooldown"] <= 0.1 and aim_error(then, aims[i]) * dists[i] < GUN_TOL and off < T["r"] + GUN_TOL
+                if DEBUG and T and T["kind"] == "mech" and T["los"]:
+                    why = ("fire" if fire[i] else "reload" if w.get("reload") or not w.get("ammo", 1) else "cooldown" if w["cooldown"] > 0.1
+                           else "nopoint" if self._gun_dbg[0] is None else "p" if self._gun_dbg[1] < GUN_MIN_P
+                           else "range" if not ok[i] else "tol")
+                    self.dbg[why] = self.dbg.get(why, 0) + 1
             else:
-                fire[i] = ok[i] and w["cooldown"] <= 0.1 and err < tol[i]
-        gun = next((w for w in ws if w and w["kind"] == "gun"), None)
+                fire[i] = ok[i] and w["cooldown"] <= 0.1 and err < math.atan2(3, T["d"]) + 0.01
+        gun = ws[g] if g is not None else None
         calm = T is None or T["kind"] != "mech"
         reload = bool(gun) and not gun.get("reload") and (gun.get("ammo", 1) == 0 or (calm and gun.get("ammo", 0) < gun["stats"]["mag"] / 2))
         return aim, fire, reload
+
+    def point_at(self, T, tau, hgt):
+        """T's predicted position after tau s, hgt m above its feet."""
+        p, _ = self.pred.predict(T["id"], T["pos"], T["vel"], tau)
+        return [p[0], p[1], p[2] + hgt]
+
+    def gun_point(self, muzzle, T, w):
+        """(point to aim the gun at, estimated hit chance), or (None, 0) if no line of fire is clear.
+        Leads by the predicted flight time; tries the body's middle, then higher and lower, and takes the
+        first height whose corridor (the path, and the path shifted by one spread sigma each way) is clear."""
+        st = w["stats"]
+        lat = LATENCY + max(w["cooldown"], 0.0)
+        spc = self.cfg["cubes"].get("size_per_cube", 0.05)
+        hgt = self.mech["height"] * (1 + spc * T["m"].get("cubes", 0)) if T["kind"] == "mech" else T["c"][2] - T["pos"][2]
+        mid = T["c"][2] - T["pos"][2]
+        tau, p, info = lat + max(T["d"] - 3, 0) / st["speed"], T["pos"], None
+        for _ in range(3):
+            p, info = self.pred.predict(T["id"], T["pos"], T["vel"], tau)
+            tau = lat + max(math.dist(muzzle, [p[0], p[1], p[2] + mid]) - 3, 0) / st["speed"]
+        d = math.dist(muzzle, [p[0], p[1], p[2] + mid])
+        sig = max(0.4, d * math.radians(st.get("spread_deg", 0.6)))
+        r = T["r"] + self.cfg["projectile"].get("gun_radius", 0.3)
+        p_pred = info[1] if info[1] is not None else 0.7
+        p_spread = math.erf(r / (sig * math.sqrt(2)))
+        if not self.world:
+            return [p[0], p[1], p[2] + mid], p_pred * p_spread
+        side = unit(-(p[1] - muzzle[1]), p[0] - muzzle[0])
+        for z in (mid, min(mid + 1.5, hgt - 1.5), max(mid - 1.5, 1.5)):
+            pt = [p[0], p[1], p[2] + z]
+            if not self.los(muzzle, pt):
+                continue
+            shifts = ([0, 0, -sig], [0, 0, sig], [side[0] * sig, side[1] * sig, 0], [-side[0] * sig, -side[1] * sig, 0])
+            clear = sum(self.los(muzzle, [pt[j] + sh[j] for j in range(3)]) for sh in shifts)
+            if clear >= 3:
+                return pt, p_pred * p_spread * (0.75 + 0.0625 * clear)
+        return None, 0.0
+
+    def beam_point(self, muzzle, T):
+        """Where to point the laser: T's predicted body after the decision latency, at the middle, else
+        the highest or lowest part of it a beam can reach (a mech half behind a wall or a crest)."""
+        mid = T["c"][2] - T["pos"][2]
+        top = 2 * mid
+        for z in (mid, top - 1.2, top - 2.5, 1.5):
+            pt = self.point_at(T, LATENCY, z)
+            if self.los(muzzle, pt):
+                return pt
+        return None
 
     def pick_upgrade(self, ids, me):
         """Index of the offer to take: the earliest next stack in UPGRADE_PLAN, then UPGRADE_REST; never a mortar one."""
@@ -600,6 +679,10 @@ class Bot:
         x, y, z = pos
         t = self.t = obs["t"]
         self.remember(obs, t, pos)
+        spc = self.cfg["cubes"].get("size_per_cube", 0.05)
+        for m in obs["mechs"]:  # feed the motion predictor (and score it in hindsight)
+            r = self.mech["radius"] * (1 + spc * m.get("cubes", 0)) if m["kind"] == "mech" else self.cfg["npc"]["radius"]
+            self.pred.update(t, m["id"], m["pos"], m["vel"], r + 0.3, pos)
         act: mf.Action = {"tick": obs["tick"]}
         hpf = me["hp"] / max(me["max_hp"], 1)
         st = me["stats"]
@@ -635,6 +718,7 @@ class Bot:
         if self.turn_to and t - self.turn_to[1] < 1.0 and not (T and T["kind"] == "mech" and T["los"] and T["id"] in self.hit_by
                                                               and t - self.hit_by[T["id"]] < 1.0):
             aim = [self.turn_to[0], 0.0]  # hit in the back (x1.5) by someone we don't have in front of us: turn round now
+            fire = [bool(w and w["kind"] == "laser" and w.get("charge", 0) > 0) for w in me["weapons"]]  # nothing leaves off-aim; a charge is held
 
         # Movement goal.
         c, r = zone_at(obs["zone"], t + LOOKAHEAD_S)
@@ -746,6 +830,8 @@ class Bot:
                 aim = [inward + SWEEP * math.sin(2 * math.pi * t / SWEEP_S), 0.0]
 
         act.update(move=move, boost=boost, jump=jump, aim=aim, fire=fire, reload=reload)
+        if DEBUG and obs["tick"] % 200 == 0 and self.dbg:
+            mf.log("gun", sorted(self.dbg.items()))
         self.draw(pos, muzzle, goal, T, mode, me)
         return act
 

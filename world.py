@@ -1,7 +1,8 @@
 """Static map model from the arena files (protocol.md §11): ground height, solids, line of sight, A* paths.
 
-Two grids over the terrain extent:
-- fine (CELL = 2 m): ground height, the vertical span of solids (for shots), and walls (for walking);
+Three grids over the terrain extent:
+- shot (FINE = 1 m): the vertical span of solids, for line-of-fire checks (with bilinear terrain);
+- fine (CELL = 2 m): ground height, the vertical span of solids, and walls (for walking);
 - nav (NAV x NAV fine cells = 4 m): walking cost for A*.
 """
 import array
@@ -13,6 +14,7 @@ import sys
 import time
 
 CELL = 2.0
+FINE = 1.0  # m: the shot grid
 NAV = 2
 BLOCKED = 25.0  # nav cost of a wall/steep cell we can jump: crossable, but rarely worth it
 TALL = 1e4      # nav cost of a wall or cliff taller than a jump: go round (no climbing routine yet)
@@ -35,6 +37,7 @@ class World:
             raw.byteswap()
         tnx, tny, tstep, scale = t["nx"], t["ny"], t["step"], t.get("scale", 0.01)
         self.x0, self.y0 = t["minX"], t["minY"]
+        self.traw, self.tnx, self.tny, self.tstep, self.tscale = raw, tnx, tny, tstep, scale
         nx = self.nx = int((tnx - 1) * tstep // CELL)
         ny = self.ny = int((tny - 1) * tstep // CELL)
         k = CELL / tstep
@@ -81,6 +84,35 @@ class World:
                             elif pt > g + step:
                                 wall[idx] = max(wall[idx], 2 if pt > g + CLIMB else 1)
 
+        # Shots: a finer solid grid (thin walls and building corners fall between the 2 m cell centers).
+        fnx, fny = self.fnx, self.fny = int((tnx - 1) * tstep // FINE), int((tny - 1) * tstep // FINE)
+        flo = self.flo = array.array("f", [1e9]) * (fnx * fny)
+        fhi = self.fhi = array.array("f", [-1e9]) * (fnx * fny)
+        for p in w["prisms"]:
+            pb, pt = p["base"], p["top"]
+            edges = []
+            for poly in [p["ring"]] + list(p.get("holes") or []):
+                n = len(poly) // 2
+                for e in range(n):
+                    x1, y1 = poly[2 * e], poly[2 * e + 1]
+                    x2, y2 = poly[(2 * e + 2) % (2 * n)], poly[(2 * e + 3) % (2 * n)]
+                    if y1 != y2:
+                        edges.append((x1, y1, x2, y2))
+            ys = p["ring"][1::2]
+            j0 = max(int((min(ys) - self.y0) // FINE), 0)
+            j1 = min(int((max(ys) - self.y0) // FINE), fny - 1)
+            for j in range(j0, j1 + 1):
+                cy = self.y0 + (j + 0.5) * FINE
+                xs = sorted(x1 + (cy - y1) * (x2 - x1) / (y2 - y1) for x1, y1, x2, y2 in edges if (y1 <= cy) != (y2 <= cy))
+                for a, b in zip(xs[0::2], xs[1::2]):
+                    i0 = max(int((a - self.x0) // FINE), 0)
+                    i1 = min(int((b - self.x0) // FINE), fnx - 1)
+                    for idx in range(j * fnx + i0, j * fnx + i1 + 1):
+                        if pb < flo[idx]:
+                            flo[idx] = pb
+                        if pt > fhi[idx]:
+                            fhi[idx] = pt
+
         # Too steep to walk up (either way, since paths are reused both ways).
         rise = math.tan(math.radians(mech.get("max_slope_deg", 50))) * CELL
         steep = bytearray(nx * ny)
@@ -113,23 +145,33 @@ class World:
         idx = self._idx(x, y)
         return self.ground[idx] if idx >= 0 else default
 
-    def clear(self, a, b, step=1.5, skip=2.5):
-        """True if a straight shot from a to b is not stopped by terrain or a solid (trees never stop shots).
-        Ignores the first and last `skip` m, where the coarse grid would catch the shooter's or target's own wall."""
+    def ground_fine(self, x, y):
+        """Terrain height, bilinear on the 1 m source grid (what the server samples)."""
+        fx, fy = (x - self.x0) / self.tstep, (y - self.y0) / self.tstep
+        i, j = min(max(int(fx), 0), self.tnx - 2), min(max(int(fy), 0), self.tny - 2)
+        ax, ay = min(max(fx - i, 0.0), 1.0), min(max(fy - j, 0.0), 1.0)
+        n, h = self.tnx, self.traw
+        a, b, c, d = h[j * n + i], h[j * n + i + 1], h[(j + 1) * n + i], h[(j + 1) * n + i + 1]
+        return (a + (b - a) * ax + (c - a) * ay + (a - b - c + d) * ax * ay) * self.tscale
+
+    def clear(self, a, b, step=1.0, skip=3.0, skip_end=1.0):
+        """True if a straight shot from a to b is not stopped by terrain or a solid (trees never stop shots),
+        on the 1 m shot grid with bilinear terrain. Ignores the first `skip` m (a shot leaves 3 m out from
+        the muzzle) and the last `skip_end` m (the target's own body)."""
         d = math.dist(a, b)
         n = int(d / step)
         if n < 2:
             return True
-        x0, y0, nx, ny, ground, lo, hi = self.x0, self.y0, self.nx, self.ny, self.ground, self.lo, self.hi
+        x0, y0, fnx, fny, lo, hi, gf = self.x0, self.y0, self.fnx, self.fny, self.flo, self.fhi, self.ground_fine
         dx, dy, dz = (b[0] - a[0]) / n, (b[1] - a[1]) / n, (b[2] - a[2]) / n
-        k0 = int(skip / (d / n)) + 1
-        for k in range(k0, n - k0 + 1):
+        sl = d / n
+        for k in range(int(skip / sl) + 1, n - int(skip_end / sl)):
             x, y, z = a[0] + dx * k, a[1] + dy * k, a[2] + dz * k
-            i, j = int((x - x0) // CELL), int((y - y0) // CELL)
-            if not (0 <= i < nx and 0 <= j < ny):
+            i, j = int((x - x0) // FINE), int((y - y0) // FINE)
+            if not (0 <= i < fnx and 0 <= j < fny):
                 return False
-            idx = j * nx + i
-            if z < ground[idx] - 0.5 or lo[idx] <= z <= hi[idx]:
+            idx = j * fnx + i
+            if lo[idx] <= z <= hi[idx] or z < gf(x, y):
                 return False
         return True
 
