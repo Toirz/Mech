@@ -29,7 +29,8 @@ LASER_MARGIN = 0.8   # m: the beam must point this far inside the target's edge 
 DROP_HP = 0.7        # go for a supply drop only with this much HP,
 DROP_CALM_S = 5.0    # not shot at for this long,
 DROP_CLEAR, DROP_CLEAR_S = 150.0, 10.0  # and no mech seen this close to it in this long (it's where the whole map heads)
-QUIET_MOVE = 0.42    # |move| under 5 m/s (0.42 of 11.7): no step sound
+HOP_JET_S = 0.6      # s of jet after an unstick hop (jump 2.75 m + this clears any ledge we path over)
+QUIET_MOVE = 0.42   # |move| under 5 m/s (0.42 of 11.7): no step sound
 DEBUG = bool(__import__("os").environ.get("BOT_DEBUG"))
 # Upgrade order, one entry per stack; with lightning in hand its two upgrades come right after laser_charge.
 UPGRADE_PLAN = ["plating", "laser_damage", "nanites", "plating", "laser_damage", "laser_charge", "plating", "armor",
@@ -134,6 +135,7 @@ class Bot:
         self.hist = []                   # (t, x, y, wanted to move)
         self.stuck_since = None
         self.unstick_until, self.unstick_dir = -1.0, [0.0, 0.0]
+        self.hop_t = -1e9                # last unstick hop
         self.threat = None               # (bearing, t) of the last hit we took
         self.turn_to = None              # (bearing, t): hit in the back by someone we can't see: face that way a moment
         self.heard = None                # (bearing, t, dist) of the last mech sound
@@ -606,6 +608,8 @@ class Bot:
             move = self.unstick_dir
         elif stuck:
             jump = me["grounded"] and not fighting
+            if jump:
+                self.hop_t = t
             if t - self.stuck_since > 2.5:
                 a = math.atan2(move[1], move[0]) + self.rng.choice((-1, 1)) * math.pi / 2
                 self.unstick_dir, self.unstick_until = [math.cos(a), math.sin(a)], t + 1.0
@@ -615,6 +619,8 @@ class Bot:
         if fighting:  # boost through the whole fight, walking just long enough to recharge (duel-tested; jets lost)
             self.burn = me["energy"] > 70 if not self.burn else me["energy"] > 25
             boost = boost or (self.burn and me["grounded"])
+        if not me["grounded"] and t - self.hop_t >= HOP_JET_S:
+            boost = False  # in the air, jet only just after a hop: enough to clear a ledge, not a climb up a wall
 
         # Where to look when there's nothing to shoot.
         if aim is None:
