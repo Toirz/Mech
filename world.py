@@ -21,6 +21,7 @@ TALL = 1e4      # nav cost of a wall or cliff taller than a jump: go round (no c
 CLIMB = 2.5     # m: a jump clears 11^2 / (2 * 22) = 2.75 m
 PATH_WEIGHT = 2.5  # weighted A*: somewhat longer paths, far fewer expansions in Python
 SQ2 = math.sqrt(2)
+RIM = [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1), (0.7, 0.7), (0.7, -0.7), (-0.7, 0.7), (-0.7, -0.7)]
 NEIGH = [(1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0), (0, -1, 1.0), (1, 1, SQ2), (1, -1, SQ2), (-1, 1, SQ2), (-1, -1, SQ2)]
 
 
@@ -53,6 +54,7 @@ class World:
         wall = bytearray(nx * ny)
         surf = self.surf = array.array("f", ground)  # what you walk on: ground, or a low bridge deck
         height, step = mech.get("height", 9), mech.get("step_up", 1.2)
+        self.body = (mech.get("radius", 2.5), height, step)
         for p in w["prisms"]:
             pb, pt, bridge = p["base"], p["top"], p["kind"] == "bridge"
             edges = []
@@ -184,6 +186,17 @@ class World:
     def nav_center(self, c):
         s = CELL * NAV
         return [self.x0 + (c % self.mnx + 0.5) * s, self.y0 + (c // self.mnx + 0.5) * s]
+
+    def body_free(self, x, y, z):
+        """Could a body with feet at z stand here: no ground more than a step up, no solid in it, not off the map
+        (its centre and 8 points on its rim, on the 2 m grid)."""
+        r, height, step = self.body
+        lo, hi, ground, top = self.lo, self.hi, self.ground, z + step
+        for dx, dy in RIM:
+            idx = self._idx(x + dx * r, y + dy * r)
+            if idx < 0 or ground[idx] > top or (lo[idx] < z + height and hi[idx] > top):
+                return False
+        return True
 
     def free(self, x, y):
         I, J = int((x - self.x0) // (CELL * NAV)), int((y - self.y0) // (CELL * NAV))

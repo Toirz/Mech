@@ -18,6 +18,7 @@ ARRIVED = 3.0        # m from a goal: stand still (silent, and HP regens)
 LOOT_RANGE = 200.0   # m: farthest we walk for a weapon or cube (roaming: we go looking)
 CUBE_KEEP = 15       # past this, cubes only make us bigger (stats cap at 10; 15 = one more upgrade)
 MORTAR_MIN = 20.0    # m: closer than this our own splash and knockback hurt us
+SLIDE_AHEAD = 1.2    # m: look this far along the move for walls (one decision at walk speed)
 PATH_BUDGET = 0.01   # s of A* per decision (the whole decision must fit in 50 ms)
 MAP_MARGIN = 15.0    # m: goals stay this far inside the map edge (a wall); the first zone is bigger than the map
 MECH_SOUNDS = {"gun", "mortar", "laser", "laser_charge", "lightning", "step", "boost", "reload", "jet"}
@@ -537,7 +538,22 @@ class Bot:
             if not self.world.line_free(pos, wp):
                 break
             tgt = wp
-        return unit(tgt[0] - pos[0], tgt[1] - pos[1])
+        return self.slide(pos, unit(tgt[0] - pos[0], tgt[1] - pos[1]), self.path[1] if len(self.path) > 1 else goal)
+
+    def slide(self, pos, d, nxt):
+        """Hug the wall: if the body would hit something SLIDE_AHEAD m along d, turn toward open ground in steps,
+        on the side of the waypoint after this one; head-on into a wall or a corner we'd just stand there."""
+        w, (x, y, z) = self.world, pos
+        if w.body_free(x + d[0] * SLIDE_AHEAD, y + d[1] * SLIDE_AHEAD, z):
+            return d
+        a0 = math.atan2(d[1], d[0])
+        side = 1 if ang_diff(math.atan2(nxt[1] - y, nxt[0] - x), a0) >= 0 else -1
+        for k in range(1, 9):  # 20 deg steps, up to 160 deg: the preferred side first, then the other
+            for s in (side, -side):
+                a = a0 + s * k * math.radians(20)
+                if w.body_free(x + math.cos(a) * SLIDE_AHEAD, y + math.sin(a) * SLIDE_AHEAD, z):
+                    return [math.cos(a), math.sin(a)]
+        return d
 
     def loot_items(self, me):
         """Remembered loot we want: weapon pickups we'd take, and cubes while we still gain from them."""
