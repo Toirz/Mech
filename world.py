@@ -272,11 +272,40 @@ class World:
         return -1
 
     def reachable(self, a, b):
-        """Can a mech at a walk to b? Same two-way component, or b lower (it can drop down)."""
+        """Can a mech at a walk to b? Same two-way component, or b in the main area (we drop off our roof to it)."""
         A, B = self.snap(a[0], a[1], 4), self.snap(b[0], b[1], 4)
         if A < 0 or B < 0:
             return False
-        return self.comp[A] == self.comp[B] or (self.comp[B] == self.main and self.floor[B] < self.floor[A])
+        return self.comp[A] == self.comp[B] or self.comp[B] == self.main
+
+    def spot_in(self, me, cx, cy, r, comp=None):
+        """The open cell nearest `me` inside the circle (cx, cy, r) that a mech in area `comp` can walk to (its own
+        area, or the main one it can drop into), or None when the whole circle is out of reach on foot."""
+        d = math.hypot(me[0] - cx, me[1] - cy)
+        base = math.atan2(me[1] - cy, me[0] - cx) if d > 1e-6 else 0.0
+        first = min(d, r)
+        best, bd = None, 1e18
+        for rho in (first, 0.66 * r, 0.33 * r, 0.0):
+            if rho > first:
+                continue
+            for da in (0.0, 0.35, -0.35, 0.7, -0.7, 1.1, -1.1, 1.6, -1.6, 2.3, -2.3, math.pi):
+                px, py = cx + rho * math.cos(base + da), cy + rho * math.sin(base + da)
+                C = self.snap(px, py, 4, comp=comp)
+                if C < 0 and comp is not None and comp != self.main:
+                    C = self.snap(px, py, 4, comp=self.main)
+                if C < 0:
+                    continue
+                qx, qy = self.center(C)
+                e = math.hypot(qx - me[0], qy - me[1])
+                if math.hypot(qx - cx, qy - cy) <= r and e < bd:
+                    best, bd = (qx, qy), e
+            if best is not None:
+                break
+        return best
+
+    def area(self, x, y):
+        C = self.snap(x, y, 4)
+        return self.comp[C] if C >= 0 else -1
 
     def walkable_line(self, a, b):
         """A straight walk from a to b crosses only open cells and steps a mech walks up without a jump."""
@@ -303,18 +332,9 @@ class PathJob:
         self.goal_xy = (goal[0], goal[1])
         self.path, self.done = None, False
         s = world.snap(start[0], start[1], 6)
-        if s >= 0 and world.comp[s] != world.main:
-            # On a roof or in a walled pocket: walk straight to the nearest cell of the main area (off the edge;
-            # a wall in the way is the stuck routine's job), then plan from there.
-            m = world.snap(start[0], start[1], 40, comp=world.main)
-            if m >= 0:
-                self.path, self.done = [world.center(m)], True
-                return
         g = world.snap(goal[0], goal[1], 12, comp=world.comp[s]) if s >= 0 else -1
-        if s >= 0 and g < 0:  # the goal is in another area: only reachable if it lies below us (drop down to it)
+        if s >= 0 and g < 0 and world.comp[s] != world.main:  # on a roof or in the stadium: drop off its edge
             g = world.snap(goal[0], goal[1], 12, comp=world.main)
-            if g >= 0 and world.floor[g] >= world.floor[s] - 1.0:
-                g = -1
         if s < 0 or g < 0:
             self.done = True
             return
@@ -373,6 +393,28 @@ class PathJob:
                     best[D] = g2
                     parent[D] = C
                     heapq.heappush(open_, (g2 + self._h(D), g2, D))
+            # Drop links: off a roof or the stands, the cells along the edge are blocked (the edge runs through
+            # them, or the wall below is too close). Jump that band of 1-2 cells to open ground at least CLIMB lower.
+            for di, dj, dist in ((1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0), (0, -1, 1.0),
+                                 (1, 1, SQ2), (1, -1, SQ2), (-1, 1, SQ2), (-1, -1, SQ2)):
+                for k in (2, 3):
+                    I2, J2 = I + di * k, J + dj * k
+                    I1, J1 = I + di * (k - 1), J + dj * (k - 1)
+                    if not (0 <= I2 < NX and 0 <= J2 < NY):
+                        break
+                    B = J1 * NX + I1
+                    if not blocked[B] or floor[B] > fc + up:
+                        break
+                    D = J2 * NX + I2
+                    if blocked[D]:
+                        continue
+                    if floor[D] < fc - CLIMB:
+                        g2 = gc + k * dist + DROP_COST
+                        if g2 < best.get(D, 1e18):
+                            best[D] = g2
+                            parent[D] = C
+                            heapq.heappush(open_, (g2 + self._h(D), g2, D))
+                    break
         self.done = True  # no way there
         return True
 
