@@ -35,7 +35,7 @@ REPO = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 import sim  # noqa: E402
 
-BOT_FILES = ["example_bot.py", "world.py", "mechfight.py"]
+BOT_FILES = ["example_bot.py", "world.py", "mechfight.py", "predict.py"]
 CACHE = os.path.join(HERE, ".bots")
 LOADOUTS = {"gun": ["gun", None], "gun+laser": ["gun", "laser"], "gun+lightning": ["gun", "lightning"], "gun+mortar": ["gun", "mortar"]}
 
@@ -115,7 +115,7 @@ def play(job):
     if swapped:
         spawns = spawns[::-1]
         lo = lo[::-1]
-    bots = [(["python3", "-u", "example_bot.py"], cand_dir), (["python3", "-u", "example_bot.py"], opp_dir)]
+    bots = [(["python3", "-u", "example_bot.py"], cand_dir), (["python3", "-u", "example_bot.py"], opp_dir)]  # BOT_DEBUG=1 in the env: debug counters in --logs
     log_dir = None
     if a.logs:
         log_dir = os.path.join(a.logs, f"o{oi}-r{rnd}-{'b' if swapped else 'a'}")
