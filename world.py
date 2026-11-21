@@ -20,8 +20,39 @@ BLOCKED = 25.0  # nav cost of a wall/steep cell we can jump: crossable, but rare
 TALL = 1e4      # nav cost of a wall or cliff taller than a jump: go round (no climbing routine yet)
 CLIMB = 2.5     # m: a jump clears 11^2 / (2 * 22) = 2.75 m
 PATH_WEIGHT = 2.5  # weighted A*: somewhat longer paths, far fewer expansions in Python
+NEED = 3.5      # m of clearance (cell centre to wall-cell centre) a 2.5 m-radius body needs on the 2 m grid
+ROOMY = 6.0     # m: below this a cell is walkable but tight, and costs a little more (paths keep off walls)
+TIGHT = 1.4     # nav cost of a tight cell
 SQ2 = math.sqrt(2)
 NEIGH = [(1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0), (0, -1, 1.0), (1, 1, SQ2), (1, -1, SQ2), (-1, 1, SQ2), (-1, -1, SQ2)]
+
+
+def _clearance(blk, nx, ny, level):
+    """Chamfer distance (m) from each cell centre to the nearest cell with blk >= level; off the map counts as blocked."""
+    INF, a, b = 1e9, CELL, CELL * SQ2
+    d = array.array("f", [0.0 if v >= level else INF for v in blk])
+    for j in range(ny):  # forward pass: neighbours left, below-left, below, below-right
+        row = j * nx
+        for i in range(nx):
+            k = row + i
+            v = d[k]
+            if v == 0.0:
+                continue
+            v = min(v, (d[k - 1] + a) if i else a, (d[k - nx] + a) if j else a,
+                    (d[k - nx - 1] + b) if i and j else b, (d[k - nx + 1] + b) if j and i < nx - 1 else b)
+            d[k] = v
+    for j in range(ny - 1, -1, -1):  # backward pass: right, above-right, above, above-left
+        row = j * nx
+        for i in range(nx - 1, -1, -1):
+            k = row + i
+            v = d[k]
+            if v == 0.0:
+                continue
+            up = j < ny - 1
+            v = min(v, (d[k + 1] + a) if i < nx - 1 else a, (d[k + nx] + a) if up else a,
+                    (d[k + nx + 1] + b) if up and i < nx - 1 else b, (d[k + nx - 1] + b) if up and i else b)
+            d[k] = v
+    return d
 
 
 class World:
@@ -124,17 +155,44 @@ class World:
                     if dz > rise:  # 2: too tall to jump (the terrain also carries some roofs)
                         v = 2 if dz > CLIMB else 1
                         steep[idx], steep[nb] = max(steep[idx], v), max(steep[nb], v)
+        # The same on the 1 m terrain the server samples: a short steep bank between two 2 m cell centres
+        # (stadium tiers, embankments) is invisible above.
+        rise1, k = rise / CELL * tstep, int(CELL / tstep)
+        for j in range(tny - 1):
+            row = j * tnx
+            for i in range(tnx - 1):
+                h0 = raw[row + i]
+                for nb in (row + i + 1, row + i + tnx):
+                    dz = abs(raw[nb] - h0) * scale
+                    if dz > rise1:
+                        for v in (row + i, nb):  # the 2 m cells holding both ends
+                            ci, cj = (v % tnx) // k, (v // tnx) // k
+                            c = cj * nx + ci
+                            if ci < nx and cj < ny and surf[c] == ground[c]:  # not under a bridge deck
+                                steep[c] = max(steep[c], 2 if dz > CLIMB else 1)
 
+        # Clearance: metres from each fine cell's centre to the nearest wall / steep / map-edge cell. The body
+        # (radius 2.5 m) fits where it is >= NEED; paths keep to cells that fit, so they no longer scrape corners.
+        blk = bytes(max(a, b) for a, b in zip(wall, steep))
+        self.clr = clr = _clearance(blk, nx, ny, 1)        # from anything we can't walk through
+        tall = _clearance(blk, nx, ny, 2)                  # from what a jump can't clear either
         mnx, mny = self.mnx, self.mny = nx // NAV, ny // NAV
         cost = self.cost = array.array("f", [1.0]) * (mnx * mny)
+        self.rep = []  # per nav cell: its fine cell with the most room (waypoints go there, not to the cell centre)
         for J in range(mny):
             for I in range(mnx):
-                w = 0
+                best, bi = -1.0, 0
                 for dj in range(NAV):
-                    row = (J * NAV + dj) * nx + I * NAV
-                    w = max(w, max(wall[row:row + NAV]), max(steep[row:row + NAV]))
-                if w:
-                    cost[J * mnx + I] = TALL if w == 2 else BLOCKED
+                    for di in range(NAV):
+                        idx = (J * NAV + dj) * nx + I * NAV + di
+                        if clr[idx] > best:
+                            best, bi = clr[idx], idx
+                self.rep.append([self.x0 + (bi % nx + 0.5) * CELL, self.y0 + (bi // nx + 0.5) * CELL])
+                if best < NEED:
+                    t = max(tall[(J * NAV + dj) * nx + I * NAV + di] for dj in range(NAV) for di in range(NAV))
+                    cost[J * mnx + I] = BLOCKED if t >= NEED else TALL
+                elif best < ROOMY:
+                    cost[J * mnx + I] = TIGHT
 
     # --- fine grid ---
     def _idx(self, x, y):
@@ -182,51 +240,66 @@ class World:
         return J * self.mnx + I
 
     def nav_center(self, c):
-        s = CELL * NAV
-        return [self.x0 + (c % self.mnx + 0.5) * s, self.y0 + (c // self.mnx + 0.5) * s]
+        return list(self.rep[c])
 
     def free(self, x, y):
         I, J = int((x - self.x0) // (CELL * NAV)), int((y - self.y0) // (CELL * NAV))
-        return 0 <= I < self.mnx and 0 <= J < self.mny and self.cost[J * self.mnx + I] <= 1.0  # off the map is not walkable
+        return 0 <= I < self.mnx and 0 <= J < self.mny and self.cost[J * self.mnx + I] < BLOCKED  # off the map is not walkable
 
     def clamp(self, p, m):
         """p moved at least m inside the map edge (the edge is a wall)."""
         return [min(max(p[0], self.x0 + m), self.x0 + self.nx * CELL - m), min(max(p[1], self.y0 + m), self.y0 + self.ny * CELL - m)]
 
     def line_free(self, a, b):
-        n = int(math.dist(a[:2], b[:2]) / CELL) + 1
-        return all(self.free(a[0] + (b[0] - a[0]) * k / n, a[1] + (b[1] - a[1]) * k / n) for k in range(n + 1))
+        """The body fits all along the straight walk from a to b (checked every metre)."""
+        n = int(math.dist(a[:2], b[:2])) + 1
+        clr = self.clr
+        for k in range(n + 1):
+            idx = self._idx(a[0] + (b[0] - a[0]) * k / n, a[1] + (b[1] - a[1]) * k / n)
+            if idx < 0 or clr[idx] < NEED:
+                return False
+        return True
 
     def path(self, a, b, budget_s=0.01):
         """Waypoints [[x, y], ...] from a toward b. If the time budget runs out, the path to the
         explored cell closest to b (replanning later continues from there). [] = no progress."""
-        mnx, mny, cost = self.mnx, self.mny, self.cost
+        st = self.search(a, b)
+        self.advance(st, budget_s)
+        return self.route(st)
+
+    def search(self, a, b):
+        """A weighted A* search from a to b that advance() can run a slice at a time, over several decisions."""
         s, g = self.nav_cell(a[0], a[1]), self.nav_cell(b[0], b[1])
-        if s == g:
-            return [[b[0], b[1]]]
-        gx, gy = g % mnx, g // mnx
+        hs = self._h(s, g)
+        return {"s": s, "g": g, "b": [b[0], b[1]], "best": s, "bh": hs, "came": {s: s}, "gc": {s: 0.0},
+                "heap": [(hs, 0.0, s)], "done": s == g}
 
-        def h(c):
-            dx, dy = abs(c % mnx - gx), abs(c // mnx - gy)
-            return (max(dx, dy) + (SQ2 - 1) * min(dx, dy)) * PATH_WEIGHT
+    def _h(self, c, g):
+        mnx = self.mnx
+        dx, dy = abs(c % mnx - g % mnx), abs(c // mnx - g // mnx)
+        return (max(dx, dy) + (SQ2 - 1) * min(dx, dy)) * PATH_WEIGHT
 
-        best, bh = s, h(s)
-        came, gc = {s: s}, {s: 0.0}
-        heap = [(bh, 0.0, s)]
+    def advance(self, st, budget_s):
+        """Expand st for up to budget_s seconds. True once it is finished (goal reached or nothing left)."""
+        if st["done"]:
+            return True
+        mnx, mny, cost, h = self.mnx, self.mny, self.cost, self._h
+        g, came, gc, heap = st["g"], st["came"], st["gc"], st["heap"]
+        best, bh = st["best"], st["bh"]
         deadline = time.perf_counter() + budget_s
         n = 0
         while heap:
+            n += 1
+            if n & 63 == 0 and time.perf_counter() > deadline:
+                break
             f, gcur, cur = heapq.heappop(heap)
             if cur == g:
-                best = g
+                best, st["done"] = g, True
                 break
             if gcur > gc[cur]:
                 continue
             if f - gcur < bh:
                 best, bh = cur, f - gcur
-            n += 1
-            if n & 63 == 0 and time.perf_counter() > deadline:
-                break
             cx, cy = cur % mnx, cur // mnx
             for dx, dy, d in NEIGH:
                 x, y = cx + dx, cy + dy
@@ -239,13 +312,23 @@ class World:
                     if ng < gc.get(nb, 1e18):
                         gc[nb] = ng
                         came[nb] = cur
-                        heapq.heappush(heap, (ng + h(nb), ng, nb))
+                        heapq.heappush(heap, (ng + h(nb, g), ng, nb))
+        else:
+            st["done"] = True
+        st["best"], st["bh"] = best, bh
+        return st["done"]
+
+    def route(self, st):
+        """Waypoints to the goal if the search reached it, else to the explored cell closest to it."""
+        s, best, came = st["s"], st["best"], st["came"]
+        if s == st["g"]:
+            return [list(st["b"])]
         out = []
         c = best
         while c != s:
             out.append(self.nav_center(c))
             c = came[c]
         out.reverse()
-        if best == g and out:
-            out[-1] = [b[0], b[1]]
+        if best == st["g"] and out:
+            out[-1] = list(st["b"])
         return out

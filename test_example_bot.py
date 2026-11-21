@@ -52,7 +52,7 @@ if os.path.isdir(arena):
     for a, b in zip(free[::2], free[1::2]):
         if math.dist(a, b) < 150:
             path = w.path(a, b, 0.2)
-            assert path and all(math.dist(p, q) < 9 for p, q in zip([a] + path, path)), "path steps are neighbor cells"
+            assert path and all(math.dist(p, q) < 10 for p, q in zip([a] + path, path)), "path steps are neighbor cells"
             reached += math.dist(path[-1], b) < 1
     assert reached > 0
     # Roof loot: an item on a 5-45 m roof counts as on a roof, and its launch spot is walkable ground near it.
