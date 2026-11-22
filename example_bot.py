@@ -1,7 +1,7 @@
 """Bot: roam the safe circle hunting lasers, cubes and supply drops; hide to heal when hurt; fight with the right weapon.
 
 Priorities each decision (movement): dodge a shell > get back in the zone > capture a supply drop
-> hide out of sight (below HIDE_HP, until HEALED_HP) > get away from strong mechs (and, hurt, from any mech near us)
+> hide out of sight (below HIDE_HP, until HEALED_HP: silently, along safe ground, into a safe wall corner) > get away from strong mechs (and, hurt, from any mech near us)
 > run down a weak mech (healthy) > a laser in the first minute > loot on the ground > loot on a roof (only when calm:
 from within FLY_RANGE, jet straight at it and drop onto it) > stand and strafe against a mech in a fight
 > go for a lone mech (healthy) > roam to the least recently visited cell.
@@ -22,11 +22,13 @@ heard in the last FACE_S, the sound we just heard; whoever just hit us first); o
 and right and glance behind every few seconds (looking first at any older ghost near where we are going).
 """
 import math
+import os
 import random
+import time
 
 import mechfight as mf
 from predict import Predictor
-from world import World
+from world import CELL, CORNER, NAV, World
 
 EDGE_MARGIN = 12.0   # m to stay inside the zone edge
 LOOKAHEAD_S = 4.0    # aim for where the edge will be, so a shrinking zone doesn't catch us
@@ -61,6 +63,12 @@ SWEEP, SWEEP_W = 1.2, 2.5  # rad either side of the way we face, and the sweep's
 GLANCE_EVERY = (5.0, 8.0)  # s between two looks behind
 GLANCE_S = 1.0       # s a look behind lasts (turning round takes 0.75 s at 4 rad/s)
 SILENT = 0.4         # move length that keeps us under step_speed (5 m/s): no step sounds
+HIDE_R = 60.0        # m: hiding spots are looked for this far around us (4 m cells)
+HIDE_EVERY = 2.0     # s between two searches for a hiding spot
+HIDE_CHECK = (24, 0.006)  # at most this many spots, or s, of line-of-sight checks per search
+HIDE_NEAR = 30.0     # m: no hiding spot this close to a mech on our map
+DANGER_R = 70.0      # m: a mech on our map makes hiding spots and the way there worse this close to it
+SAFE_W = 1.5         # extra A* cost per 4 m step, hiding, through a cell seen from all 24 directions
 FIGHT_RANGE = 150.0  # m: a seen mech this close (or one shooting us) stops the roam: stand and strafe
 ROOF_Z = 3.0         # m above the terrain: an item this high is on a roof (a jump clears 2.75 m)
 ROOF_MAX = 45.0      # m: highest roof we jet up to for loot (100 energy climbs about 60 m)
@@ -165,9 +173,12 @@ class Bot:
         self.world = None
         try:
             self.world = World(hello["map"]["dir"], self.mech)
+            if self.world.load_safety(os.path.join(os.path.dirname(os.path.abspath(__file__)), "safety.json")) is None:
+                mf.log("no safety map for this map: hiding by sight lines and walls only")
         except Exception as e:  # without the map we still play: straight lines, no cover checks
             mf.log(f"map not loaded, playing without it: {e!r}")
-        self.path, self.path_goal, self.path_t = [], None, -1e9
+        self.path, self.path_goal, self.path_t, self.path_safe = [], None, -1e9, False
+        self.hide_dbg = []               # the hiding spots the last search weighed: [spot, score, out of sight / None]
         self.hist = []                   # (t, x, y, wanted to move)
         self.stuck_since = None
         self.unstick_until, self.unstick_dir = -1.0, [0.0, 0.0]
@@ -236,6 +247,10 @@ class Bot:
     def los(self, a, b):
         return self.world.clear(a, b) if self.world else True
 
+    def sees(self, a, b):
+        """Sight, not a shot: trees count (trunks, and thick crown past the near range)."""
+        return self.world.sees(a, b) if self.world else True
+
     def strength(self, hp, cubes, kinds):
         """How much fight a mech has, to compare with ours: HP x its cube damage bonus x firepower (best weapon
         plus a third of the second: a gun 0.5, a laser 1.0)."""
@@ -296,7 +311,7 @@ class Bot:
                 continue
             if d > V["near_range"] and abs(ang_diff(math.atan2(q[1] - pos[1], q[0] - pos[0]), aim_yaw)) > math.radians(V["fov_deg"]) / 2 - 0.1:
                 continue
-            if self.los(eye, [q[0], q[1], q[2] + mid]):
+            if self.sees(eye, [q[0], q[1], q[2] + mid]):
                 del self.ghosts[k]
 
     def crowd(self, p, t, r=CROWD_R):
@@ -328,7 +343,7 @@ class Bot:
                     continue
                 first = first or p
                 z = self.world.ground_at(p[0], p[1]) if self.world else pos[2]
-                if not any(self.los(w, [p[0], p[1], z + mid]) for w in watchers):
+                if not any(self.sees(w, [p[0], p[1], z + mid]) for w in watchers):
                     self.evade, self.evade_t = p, t
                     return p
         self.evade, self.evade_t = first, t
@@ -347,7 +362,7 @@ class Bot:
         eye = [pos[0], pos[1], pos[2] + self.mech.get("eye_height", 8)]
         for q in self.lost(pos, t, 3):
             if d2(q, pos) < self.cfg["vision"]["range"] - 5 and (d2(q, goal) < CROWD_R or d2(q, pos) < 120) \
-                    and self.los(eye, [q[0], q[1], q[2] + self.mech["height"] / 2]):
+                    and self.sees(eye, [q[0], q[1], q[2] + self.mech["height"] / 2]):
                 return q
         return None
 
@@ -663,46 +678,83 @@ class Bot:
         self.roam, self.roam_t = best, t
         return best
 
-    def cover_spot(self, pos, c, r, enemies, t):
-        """A walkable spot within 40 m, inside the safe circle, out of sight of every known enemy (and of a
-        shooter we only felt, assumed 80 m out along the hit's bearing). Our own spot if nobody is known."""
-        eye = self.mech.get("eye_height", 8.0)
-        ws = sorted(enemies, key=lambda m: d2(m["pos"], pos))[:4]
-        watchers = [[m["pos"][0], m["pos"][1], m["pos"][2] + eye] for m in ws]
-        watchers += [[q[0], q[1], q[2] + eye] for q in self.lost(pos, t, 2) if d2(q, pos) < 150]
+    def hide_spot(self, pos, c, r, t):
+        """Where to hide: a walkable spot within HIDE_R, inside the safe circle, out of sight of the mechs we know of
+        (the 4 nearest on our map, seen, lost or heard, and a shooter we only felt, assumed 80 m out along the hit's
+        bearing), the best for: seen from few directions (the safety map), walls on two sides (a corner), far from
+        the mechs on our map, near us; if none of the best few is out of sight, the best of all anyway (less exposed,
+        farther off). Redone every HIDE_EVERY s; the old spot stays while it is still out of sight and not clearly
+        worse. None if there is no walkable spot."""
+        w = self.world
+        rr = max(r - EDGE_MARGIN, 0.0)
+        if not w:
+            return list(pos[:2]) if d2(pos, c) < rr else None
+        if t - self.cover_t < HIDE_EVERY:
+            return self.cover
+        eye, mid, S = self.mech.get("eye_height", 8.0), self.mech["height"] / 2, CELL * NAV
+        spots = [g["pos"] for g in self.ghosts.values() if t - g["t"] <= GHOST_S]
+        watchers = [[q[0], q[1], q[2] + eye] for q in sorted(spots, key=lambda q: d2(q, pos))[:4]]
         if self.threat and t - self.threat[1] < 5:
             b = self.threat[0]
             watchers.append([pos[0] + 80 * math.cos(b), pos[1] + 80 * math.sin(b), pos[2] + eye])
-        rr = max(r - EDGE_MARGIN, 0.0)
-        if not watchers or not self.world:
-            return list(pos[:2]) if d2(pos, c) < rr else None
-        mid = self.mech["height"] / 2
 
         def hidden(p):
-            q = [p[0], p[1], self.world.ground_at(p[0], p[1]) + mid]
-            return not any(self.los(w, q) for w in watchers)
-        if t - self.cover_t < 1.0:  # the search costs line-of-sight rays: redo it once a second (None included)
-            return self.cover
-        if self.cover and hidden(self.cover):
-            self.cover_t = t
-            return self.cover
-        for dist in (0, 8, 16, 28, 40):
-            for i in range(12 if dist else 1):
-                a = i * math.pi / 6
-                p = [pos[0] + dist * math.cos(a), pos[1] + dist * math.sin(a)]
-                if (d2(p, c) < rr and self.world.free(*p)
-                        and all(d2(m["pos"], p) > d2(m["pos"], pos) - 5 for m in ws) and hidden(p)):  # not toward them
-                    self.cover, self.cover_t = p, t
-                    return p
-        self.cover, self.cover_t = None, t
-        return None
+            q = [p[0], p[1], w.ground_at(p[0], p[1]) + mid]
+            return not any(self.sees(o, q) for o in watchers)
 
-    def steer(self, pos, goal, t, force=False):
-        """Unit move vector toward goal along an A* path."""
+        def score(p):
+            i = w.nav_cell(p[0], p[1])
+            e = w.expo[i] if w.expo and w.expo[i] <= 24 else 12
+            danger = sum(max(0.0, 1 - d2(q, p) / DANGER_R) for q in spots)
+            return d2(p, pos) / 10 + e + (0 if CORNER[w.walls[i]] == 2 else 6) + 30 * danger
+        cands = []
+        for J in range(max(int((pos[1] - HIDE_R - w.y0) // S), 0), min(int((pos[1] + HIDE_R - w.y0) // S), w.mny - 1) + 1):
+            for I in range(max(int((pos[0] - HIDE_R - w.x0) // S), 0), min(int((pos[0] + HIDE_R - w.x0) // S), w.mnx - 1) + 1):
+                if w.cost[J * w.mnx + I] > 1.0:
+                    continue
+                p = [w.x0 + (I + 0.5) * S, w.y0 + (J + 0.5) * S]
+                if d2(p, pos) <= HIDE_R and d2(p, c) < rr and not any(d2(q, p) < HIDE_NEAR for q in spots):
+                    cands.append((score(p), p))
+        cands.sort(key=lambda e: e[0])
+        self.hide_dbg = [[p, sc, None] for sc, p in cands[:HIDE_CHECK[0]]]  # the best few, and which we found out of sight
+        best, deadline = None, time.perf_counter() + HIDE_CHECK[1]
+        for k, (sc, p) in enumerate(cands[:HIDE_CHECK[0]]):  # the line-of-sight rays cost: only the best few
+            self.hide_dbg[k][2] = ok = hidden(p)
+            if ok:
+                best = (sc, p)
+                break
+            if time.perf_counter() > deadline:
+                break
+        if best is None and cands and not (self.cover and hidden(self.cover)):
+            best = cands[0]  # nowhere out of sight close by: the least exposed, safest spot anyway
+        cur = self.cover
+        if cur and d2(cur, c) < rr and not any(d2(q, cur) < HIDE_NEAR for q in spots) and hidden(cur) \
+                and (best is None or score(cur) <= best[0] + 3):
+            best = (None, cur)  # still good: no wandering between near-equal spots
+        self.cover, self.cover_t = (best[1] if best else None), t
+        return self.cover
+
+    def safety_cost(self, t):
+        """Extra A* cost per step while hiding: cells seen from many directions (the safety map), and cells near the
+        mechs on our map."""
+        w = self.world
+        expo, mnx, x0, y0, S = w.expo, w.mnx, w.x0, w.y0, CELL * NAV
+        spots = [g["pos"] for g in self.ghosts.values() if t - g["t"] <= GHOST_S]
+
+        def extra(i):
+            e = expo[i] if expo and expo[i] <= 24 else 12
+            x, y = x0 + (i % mnx + 0.5) * S, y0 + (i // mnx + 0.5) * S
+            return SAFE_W * e / 24 + sum(4.0 * max(0.0, 1 - math.hypot(x - q[0], y - q[1]) / DANGER_R) for q in spots)
+        return extra
+
+    def steer(self, pos, goal, t, force=False, extra=None):
+        """Unit move vector toward goal along an A* path (with `extra` step costs, see World.path)."""
         if not self.world:
             return unit(goal[0] - pos[0], goal[1] - pos[1])
-        if force or not self.path or self.path_goal is None or d2(goal, self.path_goal) > 6 or t - self.path_t > 2.5:
-            self.path, self.path_goal, self.path_t = self.world.path(pos, goal, PATH_BUDGET), list(goal), t
+        if (force or not self.path or self.path_goal is None or d2(goal, self.path_goal) > 6 or t - self.path_t > 2.5
+                or (extra is not None) != self.path_safe):
+            self.path, self.path_goal, self.path_t = self.world.path(pos, goal, PATH_BUDGET, extra), list(goal), t
+            self.path_safe = extra is not None
         while len(self.path) > 1 and d2(pos, self.path[0]) < 4:
             self.path.pop(0)
         if not self.path:
@@ -859,7 +911,7 @@ class Bot:
             out = not self.hiding and (healthy or not near)  # hurt, we go for things only while the map is clear around us
             loot = self.loot_goal(me, pos, c, r, most, strong) if out else None
             early = self.early_laser(me, pos, enemies, most, strong) if t < EARLY_S and not shot_at and out else None
-            hide = self.cover_spot(pos, c, r, enemies, t) if self.hiding and not drop and not under_fire else None
+            hide = self.hide_spot(pos, c, r, t) if self.hiding and not drop and not under_fire else None
             # keep away from strong mechs near us; hurt, from any mech near us
             threats = [q for q in strong if d2(q, pos) < AVOID_R] + ([] if healthy else near)
             evade = (self.evade_spot(pos, c, r, threats, t) if threats and not self.hiding and not under_fire
@@ -916,7 +968,8 @@ class Bot:
             if down:
                 move = unit(down[0] - x, down[1] - y)
         if move is None:
-            move = self.steer(pos, goal, t, force=self.stuck_since is not None and t - self.stuck_since > 1) if gap > arrive else [0.0, 0.0]
+            move = self.steer(pos, goal, t, force=self.stuck_since is not None and t - self.stuck_since > 1,
+                              extra=self.safety_cost(t) if mode == "hide" and self.world else None) if gap > arrive else [0.0, 0.0]
             duel = engaged and mode in ("loot", "laser", "chase") and gap > 8  # trading shots on the way: zigzag there
             if (mode in ("edge", "fight") or duel) and T and T["kind"] == "mech" and T["los"]:  # strafe across their line of fire
                 if t >= self.strafe_until:
@@ -929,7 +982,7 @@ class Bot:
         # Stuck: commanded to move but not getting anywhere -> jump and jet; if that fails too, sidestep.
         # Not while fighting inside the zone (hopping about loses the fight); outside it the zone kills faster than they do.
         fighting = bool(T and T["kind"] == "mech" and T["los"] and me["in_zone"])
-        wants_move = math.hypot(*move) > 0.5
+        wants_move = math.hypot(*move) > 0.3
         self.hist = [h for h in self.hist if t - h[0] < 1.2] + [(t, x, y, wants_move)]
         h0 = self.hist[0]
         stuck = (len(self.hist) >= 10 and all(h[3] for h in self.hist) and math.hypot(x - h0[1], y - h0[2]) < 1.5
@@ -946,8 +999,8 @@ class Bot:
                 self.stuck_since, self.path = None, []
         boost = climbing or mode in ("dodge shell", "zone") or (stuck and not fighting) or (
             gap > 40 and me["energy"] > 60 and not T and mode != "roof" and healthy)  # save the energy for the jet; hurt: quiet
-        if self.hiding and not T and not stuck and mode in ("hide", "edge") and any(d2(q, pos) < 60 for q in self.lost(pos, t, 1)):
-            move = [move[0] * SILENT, move[1] * SILENT]  # a lost mech close by: creep, no step sounds
+        if self.hiding and not stuck and t >= self.unstick_until and mode in ("hide", "edge"):
+            move = [move[0] * SILENT, move[1] * SILENT]  # hiding: creep under step_speed, no step sounds
         if fighting:  # boost through the whole fight, walking just long enough to recharge (duel-tested; jets lost)
             self.burn = me["energy"] > 70 if not self.burn else me["energy"] > 25
             boost = boost or (self.burn and me["grounded"])

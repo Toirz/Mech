@@ -64,6 +64,38 @@ if os.path.isdir(arena):
     assert rb.on_roof(item) and not rb.on_roof([item[0], item[1], w.ground[i]])
     ls = rb.launch_spot(item)
     assert ls and w.free(*ls) and math.dist(ls, item[:2]) < 32, ls
+    # Hiding: the shipped safety map loads for this map only; corners are where walls meet. With a mech 60 m off,
+    # the bot picks a spot within 60 m that it can't see, and the way there costs more near that mech.
+    import json as _json
+    import tempfile as _tmp
+    from world import CORNER
+    here = os.path.dirname(os.path.abspath(__file__))
+    assert w.load_safety(os.path.join(here, "safety.json")) is not None and w.expo
+    other = _tmp.NamedTemporaryFile("w", suffix=".json", delete=False)
+    _json.dump({"map": [0, 0, 0, 0, 0], "cell": 4.0, "data": "A" * (w.mnx * w.mny)}, other)
+    other.close()
+    assert w.load_safety(other.name) is None and w.expo  # made for another map: ignored, the good one stays
+    os.unlink(other.name)
+    assert sum(CORNER[m] == 2 for m in w.walls) > 100
+    hb = Bot.__new__(Bot)
+    hb.world, hb.mech, hb.threat, hb.cover, hb.cover_t, hb.hide_dbg = w, {"height": 9, "eye_height": 8}, None, None, -1e9, []
+    rng = random.Random(3)
+    cells = [i for i in range(len(w.expo)) if 8 <= w.expo[i] <= 20 and w.cost[i] <= 1.0]
+
+    def seen_by(e, q):
+        return w.sees([e[0], e[1], w.ground_at(*e) + 8], [q[0], q[1], w.ground_at(*q) + 4.5])
+    while True:  # a spot half in the open, a mech 60 m off, and somewhere within 60 m out of its sight
+        p = w.nav_center(rng.choice(cells))
+        a = rng.uniform(0, 2 * math.pi)
+        e = [p[0] + 60 * math.cos(a), p[1] + 60 * math.sin(a)]
+        if w.free(*e) and any(not seen_by(e, q) for q in map(w.nav_center, range(len(w.cost)))
+                              if math.dist(q, p) <= 60 and math.dist(q, e) >= 30 and w.free(*q)):
+            break
+    hb.ghosts = {1: {"pos": [e[0], e[1], w.ground_at(*e)], "t": 0.0, "r": 0.0}}
+    spot = hb.hide_spot([p[0], p[1], w.ground_at(*p)], [0, 0], 5000, 0.0)
+    assert spot and w.free(*spot) and math.dist(spot, e) >= 30 and not seen_by(e, spot), spot
+    cost = hb.safety_cost(0.0)
+    assert cost(w.nav_cell(*e)) > cost(w.nav_cell(*spot)) and w.path(p, spot, 0.05, cost)
 # Roaming heads for cells we haven't been to, inside the safe circle; hiding without a map stays put.
 b = Bot.__new__(Bot)
 b.rng, b.world, b.visited, b.roam, b.roam_t = random.Random(2), None, {}, None, -1e9
@@ -75,7 +107,7 @@ for x in range(-200, 1, 40):  # the west half is freshly visited
 g = b.roam_goal([0, 0, 0], [0, 0], 250, 100.0)
 assert g and math.hypot(*g) < 233 and g[0] > 0, g
 assert b.roam_goal([1, 1, 0], [0, 0], 250, 101.0) == g  # keeps its waypoint until there
-assert b.cover_spot([5, 6, 0], [0, 0], 250, [{"pos": [50, 0, 0]}], 0.0) == [5, 6]
+assert b.hide_spot([5, 6, 0], [0, 0], 250, 0.0) == [5, 6]  # no map: hide where we stand
 # Ghosts: a mech that left our view stays where we lost it; it counts near items, and looking there with
 # nothing listed forgets it. With nothing to shoot we sweep either side of the way we face, and glance behind.
 g = Bot.__new__(Bot)
