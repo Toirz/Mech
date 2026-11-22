@@ -9,6 +9,8 @@ Priorities each decision (movement): dodge a shell > get back in the zone > capt
 Where we look with nothing to shoot: whoever just hit us > a mech hunting us (one that aimed at us or hit us in the
 last HUNT_S: at it, at body height; roaming or farming, the scan swings round its way instead of the way we walk)
 > a mech sound just heard > the scan while roaming or farming > the way we walk > inward from the zone edge.
+Who our aim and guns serve: a hunter within NEAR_FIRST, seen or tracked behind cover (the laser pre-charged when it
+is about to show), before the best of the rest (targets(); that one still decides fighting and strafing).
 """
 import math
 import random
@@ -40,6 +42,7 @@ GUN_TOL = 1.0        # m: the gun fires only when its aim is this close to the l
 GUN_MIN_P = 0.15     # the gun holds fire below this estimated hit chance
 LASER_MARGIN = 0.8   # m: the beam must point this far inside the target's edge when we let go
 PRE_HOLD = 1.0       # s a full charge may wait for a hunter coming round cover (the server fires it itself after 2 s)
+NEAR_FIRST = 60.0    # m: a hunter this close gets our aim and guns before anyone farther, even behind cover
 DROP_RANGE = 250.0   # m: farthest we go for a supply drop (3 cubes, full HP and energy)
 ROAM_CELL = 40.0     # m: cells of the visited map; roaming heads for the one we left longest ago
 ROAM_REPICK = 25.0   # s: give up on a roam waypoint after this
@@ -286,6 +289,8 @@ class Bot:
         mechs = sorted((x for x in mechs if x["d"] < 300), key=lambda x: x["d"])[:6]
         for x in mechs:
             x["los"] = self.los(muzzle, x["c"])
+        # the closest hunter within NEAR_FIRST (in view or tracked behind cover): our weapons serve it first (act)
+        self.near = next((x for x in mechs if x["d"] <= NEAR_FIRST and x["id"] in self.hunters), None)
         npc = next((x for x in others if x["kind"] == "npc" and self.t - self.hit_by.get(x["id"], -1e9) < 3), None)
         if npc and not any(self.t - self.hit_by.get(x["id"], -1e9) < 3 for x in mechs):  # a drone is shooting us: answer it
             npc["los"] = self.los(muzzle, npc["c"])
@@ -680,7 +685,8 @@ class Bot:
         enemies = [m for m in obs["mechs"] if m["kind"] == "mech"]
         near = min(enemies, key=lambda m: d2(m["pos"], pos), default=None)
         T = self.targets(obs, me, muzzle, hpf)  # no running off in the open: a laser hits a runner just the same
-        aim, fire, reload = self.weapons(me, muzzle, tube, T, t)
+        W = self.near or T  # what we aim and shoot at: a hunter close by first (pre-charged behind cover); T moves us
+        aim, fire, reload = self.weapons(me, muzzle, tube, W, t)
         if self.turn_to and t - self.turn_to[1] < 1.0 and not (T and T["kind"] == "mech" and T["los"] and T["id"] in self.hit_by
                                                               and t - self.hit_by[T["id"]] < 1.0):
             aim = [self.turn_to[0], 0.0]  # hit in the back (x1.5) by someone we don't have in front of us: turn round now
@@ -690,7 +696,7 @@ class Bot:
             self.hiding = True
         elif hpf >= HEALED_HP:
             self.hiding = False
-        if self.hiding and not (T and T["kind"] == "mech" and (t - self.hit_by.get(T["id"], -1e9) < 5 or T["d"] < 40)):
+        if self.hiding and not (W and W["kind"] == "mech" and (t - self.hit_by.get(W["id"], -1e9) < 5 or W["d"] < 40)):
             # regen needs 5 s without dealing damage too: shoot only whoever is on us; a charge is held
             fire = [bool(w and w["kind"] == "laser" and w.get("charge", 0) > 0) for w in me["weapons"]]
 

@@ -122,6 +122,17 @@ assert not b.precharge([0, 0, 7], dict(T, los=True), laser, 60.0, [0, 0, 0])
 assert not b.precharge([0, 0, 7], T, dict(laser, cooldown=1.0), 60.0, [0, 0, 0])
 b.short_until = 61.0
 assert not b.precharge([0, 0, 7], T, laser, 60.0, [0, 0, 0])
+# Near first: a hunter within NEAR_FIRST gets our guns though targets() would rather shoot a farther, hurt mech.
+b.cfg.update(cubes={"size_per_cube": 0.05})
+b.mech.update(radius=2.5)
+b.t, b.hit_by, b.hunters = 70.0, {}, {5: [[50, 0, 0], 70.0]}
+mk = lambda i, p, hp: {"id": i, "kind": "mech", "pos": p, "vel": [0, 0, 0], "aim": [0.0, 0.0], "hp": hp, "max_hp": 1400}
+o = {"mechs": [mk(5, [50, 0, 0], 1400), mk(6, [150, 0, 0], 300)], "crates": [], "beams": []}
+gun_only = {"cubes": 0, "weapons": [{"kind": "gun"}, None]}
+assert b.targets(o, gun_only, [0, 0, 7], 1.0)["id"] == 6 and b.near["id"] == 5
+b.hunters = {}
+b.targets(o, gun_only, [0, 0, 7], 1.0)
+assert b.near is None  # not after us: no say
 # Upgrades: the drum magazine comes before the other gun upgrades (and armor), plating and laser_damage before it.
 gun = {"weapons": [{"kind": "gun"}, None], "upgrades": []}
 assert b.pick_upgrade(["gun_rate", "armor", "gun_mag"], gun) == 2
