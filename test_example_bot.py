@@ -97,15 +97,18 @@ if os.path.isdir(arena):
     assert spot and w.free(*spot) and math.dist(spot, e) >= 30 and not seen_by(e, spot), spot
     cost = hb.safety_cost(0.0)
     assert cost(w.nav_cell(*e)) > cost(w.nav_cell(*spot)) and w.path(p, spot, 0.05, cost)
-    # The opening: from a spawn in the open, the safe spot is within 120 m, walkable, inside the circle and far less
-    # exposed than the spawn; caught in the open, the nearest safe ground within 40 m is safe.
-    from example_bot import ANCHOR_R, SAFE_MAX
-    spawn = next(w.nav_center(i) for i in range(len(w.expo)) if w.expo[i] == 24 and w.cost[i] <= 1.0
-                 and math.dist(w.nav_center(i), [41.3, -72.8]) < 300)
-    anc = hb.anchor_spot([spawn[0], spawn[1], 0], [41.3, -72.8], 560, [41.3, -72.8], 380)
-    assert anc and w.free(*anc) and math.dist(anc, spawn) <= ANCHOR_R and w.expo[w.nav_cell(*anc)] <= SAFE_MAX, anc
-    sn = hb.safe_near(anc, 40)
-    assert sn and w.expo[w.nav_cell(*sn)] <= SAFE_MAX and math.dist(sn, anc) <= 40
+    # Fight or run by the ground: on ground open to fire from fewer directions we take on stronger mechs; an item
+    # in the open next to a mech as strong as us is guarded, the same item on safe ground isn't.
+    from example_bot import FIGHT_OPEN, FIGHT_SAFE
+    hb.cfg = {"cubes": {"damage_per_cube": 0.04, "stat_cap": 10}}
+    walk = [i for i in range(len(w.cost)) if w.cost[i] <= 1.0]
+    safe = w.nav_center(min(walk, key=lambda i: w.expo[i]))
+    openg = w.nav_center(next(i for i in walk if w.expo[i] == 24))
+    assert FIGHT_OPEN <= hb.fight_limit(openg) < 1.0 < hb.fight_limit(safe) <= FIGHT_SAFE
+    me_s = hb.strength(1400, 0, ["gun"])
+    for spot, guarded in ((openg, True), (safe, False)):
+        hb.ghosts = {7: {"pos": [spot[0] + 20, spot[1], 0], "t": 0.0, "r": 0.0, "s": me_s}}  # our equal, 20 m off
+        assert hb.guarded(spot, 0.0, me_s) is guarded, spot
 # A close fight: seen within 60 m locks us in; it holds while that mech is listed within 90 m (even behind cover) and
 # ends 2 s after it isn't.
 f = Bot.__new__(Bot)
@@ -173,9 +176,9 @@ mine = g.strength(1400, 0, ["gun"])
 big, small = g.strength(1960, 10, ["gun", "laser"]), g.strength(420, 0, ["gun"])
 assert big > 1.4 * mine and small < 0.7 * mine and 0.7 * mine < g.strength(1400, 0, ["gun"]) < 1.4 * mine
 g.ghosts = {7: {"pos": [120, 0, 0], "t": 50.0, "r": 0.0, "s": big}, 8: {"pos": [-100, 0, 0], "t": 50.0, "r": 0.0, "s": small}}
-assert g.strong_spots(50.0, mine) == [[120, 0, 0]]
-assert g.chase_goal([0, 0, 0], [0, 0], 500, 50.0, mine, g.strong_spots(50.0, mine)) == [-100, 0, 0]
+assert g.strong_spots(50.0, mine, 1.4) == [[120, 0, 0]]
+assert g.chase_goal([0, 0, 0], [0, 0], 500, 50.0, mine, g.strong_spots(50.0, mine, 1.4)) == [-100, 0, 0]
 g.ghosts[8]["pos"] = [100, 30, 0]  # the weak one next to the strong one: leave it
-assert g.chase_goal([0, 0, 0], [0, 0], 500, 50.0, mine, g.strong_spots(50.0, mine)) is None
+assert g.chase_goal([0, 0, 0], [0, 0], 500, 50.0, mine, g.strong_spots(50.0, mine, 1.4)) is None
 assert g.hunt_goal([0, 0, 0], [0, 0], 500, 50.0, mine) is None  # nor do we hunt the strong one
 print("ok")
