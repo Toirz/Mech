@@ -80,7 +80,7 @@ assert b.cover_spot([5, 6, 0], [0, 0], 250, [{"pos": [50, 0, 0]}], 0.0) == [5, 6
 # nothing listed forgets it. With nothing to shoot we sweep either side of the way we face, and glance behind.
 g = Bot.__new__(Bot)
 g.cfg, g.mech, g.world, g.rng = {"vision": {"range": 200, "near_range": 45, "fov_deg": 120}}, {"height": 9, "eye_height": 8}, None, random.Random(0)
-g.ghosts = {1: {"pos": [100, 0, 0], "t": 5.0}, 2: {"pos": [-100, 0, 0], "t": 5.0}, 3: {"pos": [0, 30, 0], "t": 10.0}}
+g.ghosts = {1: {"pos": [100, 0, 0], "t": 5.0, "r": 0.0}, 2: {"pos": [-100, 0, 0], "t": 5.0, "r": 0.0}, 3: {"pos": [0, 30, 0], "t": 10.0, "r": 0.0}}
 assert g.crowd([90, 0], 10.0) == 1 and g.crowd([0, 0], 10.0, 20) == 0 and g.crowd([0, 0], 10.0, 31) == 1
 g.clear_ghosts(0.0, [0, 0, 0], 10.0)
 assert sorted(g.ghosts) == [2, 3]  # the one in front is gone; the one behind and the one listed now stay
@@ -88,4 +88,23 @@ assert g.check_spot([0, 0, 0], [-90, 0], 10.0) == [-100, 0, 0]  # going its way:
 g.glance_next, g.glance_until, g.glance_side = 3.0, -1.0, 1
 assert abs(math.pi - abs(ang_diff(g.look(0.0, 3.0), 0.0))) < 0.31  # a look behind...
 assert abs(g.look(0.0, 3.0 + 1.1)) <= 1.2 + 1e-9                    # ...then the sweep again
+# Hearing: a mech sound goes on the map along its bearing, at the middle of its distance class (a step carries 40 m);
+# the next step of the same mech moves that spot instead of adding one; a far gunshot is a rough spot far off.
+g.cfg["sound"] = {"near": 60, "mid": 160, "bearing_noise_deg": 7, "range": {"step": 40, "gun": 320}}
+g.ghosts, g.heard_n = {}, 0
+g.hear({"kind": "step", "bearing": 0.0, "dist": "near", "age": 0.0}, [0, 0, 0], 20.0)
+(h,) = g.ghosts.values()
+assert abs(h["pos"][0] - 20) < 1e-9 and abs(h["pos"][1]) < 1e-9 and 20 < h["r"] < 30, h
+g.hear({"kind": "step", "bearing": 0.1, "dist": "near", "age": 0.0}, [0, 0, 0], 20.6)
+assert len(g.ghosts) == 1 and h["t"] == 20.6
+g.hear({"kind": "gun", "bearing": math.pi / 2, "dist": "far", "age": 0.0}, [0, 0, 0], 21.0)
+far = max(g.ghosts.values(), key=lambda e: e["pos"][1])
+assert len(g.ghosts) == 2 and abs(far["pos"][1] - 240) < 1e-6 and far["r"] > 80
+# Hurt, we walk away from the mech we heard (out of the circle is no way out); healthy we go for a lone mech, not a pair.
+g.evade, g.evade_t = None, -1e9
+e = g.evade_spot([0, 0, 0], [0, 0], 500, [h["pos"]], 21.0)
+assert e[0] < 0 and math.dist(e, h["pos"][:2]) > 50, e
+assert g.hunt_goal([0, 0, 0], [0, 0], 500, 21.0) == h["pos"]  # the far gunshot is too rough to go after
+g.ghosts[("h", 99)] = {"pos": [30, 10, 0], "t": 21.0, "r": 0.0}
+assert g.hunt_goal([0, 0, 0], [0, 0], 500, 21.0) is None  # two together: leave them
 print("ok")
