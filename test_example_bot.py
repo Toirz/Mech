@@ -172,4 +172,10 @@ assert fb.weapons(me, muz, muz, T, fb.t)[1][1] is False
 T["m"]["hp"] = 1400
 assert fb.weapons(me, muz, muz, T, fb.t)[1][1] is True
 assert abs(fb.laser_need(LASER, dict(T, m={"hp": 200}), me) - 0.573) < 0.001 and fb.laser_need(LASER, None, me) == 0.75
+# With a laser, a mech 40 m east pushes the strafe west; one at 100 m, a 20% one, or no laser: the strafe as it was.
+T = fb.targets({"mechs": [mech(3, [40, 0, 0])], "crates": [], "beams": []}, me, muz, 1.0)
+assert fb.keep_off([0.0, 1.0], me, T, [0, 0, 0])[0] < -0.5
+assert fb.keep_off([0.0, 1.0], me, dict(T, pos=[100, 0, 0]), [0, 0, 0]) == [0.0, 1.0]
+assert fb.keep_off([0.0, 1.0], me, dict(T, m=dict(T["m"], hp=280)), [0, 0, 0]) == [0.0, 1.0]
+assert fb.keep_off([0.0, 1.0], gun_only, T, [0, 0, 0]) == [0.0, 1.0]
 print("ok")

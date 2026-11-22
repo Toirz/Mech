@@ -36,6 +36,7 @@ DROP_RANGE = 250.0   # m: farthest we go for a supply drop (3 cubes, full HP and
 ROAM_CELL = 40.0     # m: cells of the visited map; roaming heads for the one we left longest ago
 ROAM_REPICK = 25.0   # s: give up on a roam waypoint after this
 HIDE_HP, HEALED_HP = 0.25, 0.9  # HP fraction: hide below the first, go back out at the second
+KEEP_OFF = 80.0      # m: with a laser, back away from a mech closer than this (house guns: 85% hits < 40 m, 26% at 80-120 m)
 FIGHT_RANGE = 150.0  # m: a seen mech this close (or one shooting us) stops the roam: stand and strafe
 ROOF_Z = 3.0         # m above the terrain: an item this high is on a roof (a jump clears 2.75 m)
 ROOF_MAX = 45.0      # m: highest roof we jet up to for loot (100 energy climbs about 60 m)
@@ -478,6 +479,17 @@ class Bot:
                     return (v if v != [0.0, 0.0] else [-p["vel"][1], p["vel"][0]]), "dodge shell"
         return None
 
+    def keep_off(self, move, me, T, pos):
+        """The strafe with a step back from T while it is inside KEEP_OFF and we hold a laser (it outranges their guns),
+        unless T is down to 30% (finish it). House-bot guns hit 85% inside 40 m, 52% at 40-80 m, 26% at 80-120 m
+        (andrew-zhouu, 1,457 shots in public lobbies); giddy holds 120 m with a laser."""
+        d = d2(T["pos"], pos)
+        hp = T["m"].get("hp", 1400) / max(T["m"].get("max_hp", 1400), 1)
+        if d >= KEEP_OFF or hp <= 0.3 or not any(w and w["kind"] == "laser" for w in me["weapons"]):
+            return move
+        back, k = unit(pos[0] - T["pos"][0], pos[1] - T["pos"][1]), min((KEEP_OFF - d) / 30, 1.0)
+        return unit(move[0] + back[0] * k, move[1] + back[1] * k)
+
     def free_edge_spot(self, pos, c, r):
         """edge_spot, kept inside the map (the first zone is bigger than it), slid along the circle to a walkable cell."""
         spot = edge_spot(pos, c, r, EDGE_MARGIN)
@@ -747,7 +759,7 @@ class Bot:
                 yaw = math.atan2(T["pos"][1] - y, T["pos"][0] - x) + self.strafe_sign * math.pi / 2
                 pull = min(gap / 6, 1.0)
                 to_spot = unit(goal[0] - x, goal[1] - y)
-                move = unit(math.cos(yaw) + to_spot[0] * pull, math.sin(yaw) + to_spot[1] * pull)
+                move = self.keep_off(unit(math.cos(yaw) + to_spot[0] * pull, math.sin(yaw) + to_spot[1] * pull), me, T, pos)
 
         # Stuck: commanded to move but not getting anywhere -> jump and jet; if that fails too, sidestep.
         # Not while fighting inside the zone (hopping about loses the fight); outside it the zone kills faster than they do.
