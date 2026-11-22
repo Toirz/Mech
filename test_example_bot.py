@@ -77,7 +77,7 @@ assert b.roam_goal([1, 1, 0], [0, 0], 250, 101.0) == g  # keeps its waypoint unt
 assert b.cover_spot([5, 6, 0], [0, 0], 250, [{"pos": [50, 0, 0]}], 0.0) == [5, 6]
 # Farming: drones and crates we saw are remembered until we're close and they're gone; the trip worth most cubes per metre wins.
 b.cfg = {"npc": {"cubes": 2}, "crates": {"cubes": 1}}
-b.pickups, b.cubes, b.crates, b.npcs = {}, {}, {}, {}
+b.pickups, b.cubes, b.crates, b.npcs, b.hunters = {}, {}, {}, {}, {}
 seen = {"pickups": [], "cubes": [], "events": [], "sounds": [], "crates": [{"id": 1000, "pos": [60, 0, 0], "hp": 300}],
         "mechs": [{"id": 100, "kind": "npc", "pos": [-100, 0, 0]}]}
 b.remember(seen, 10.0, [0, 0, 0])
@@ -89,6 +89,27 @@ b.remember(dict(seen, crates=[], mechs=[]), 11.0, [55, 0, 0])  # at the crate an
 assert list(b.crates) == [] and list(b.npcs) == [100]
 b.remember(dict(seen, crates=[], mechs=[]), 200.0, [55, 0, 0])  # not seen for FARM_S: forgotten
 assert b.npcs == {}
+# Hunters: a mech with its torso on us is after us (one looking away isn't); a hit from one we can't see puts it out
+# along the hit (a drone's doesn't); heard from its way at a fitting distance it is still there; gone when killed or
+# HUNT_S after the last sign of it.
+b.cfg.update(sound={"near": 60, "mid": 160})
+b.hit_by, b.threat = {}, None
+quiet = dict(seen, crates=[], mechs=[])
+mech = lambda i, p, yaw: {"id": i, "kind": "mech", "pos": p, "aim": [yaw, 0.0]}
+b.remember(dict(quiet, mechs=[mech(5, [100, 0, 0], math.pi), mech(6, [0, 80, 0], 0.0)]), 40.0, [0, 0, 0])
+assert list(b.hunters) == [5]  # 5 aims west at us from the east; 6 aims east, away from us
+b.remember(dict(quiet, sounds=[{"kind": "gun", "bearing": 0.2, "dist": "mid", "age": 0.0}]), 45.0, [0, 0, 0])
+h = b.hunters[5]
+assert h[1] == 45.0 and abs(math.atan2(h[0][1], h[0][0]) - 0.2) < 1e-9 and abs(math.hypot(*h[0][:2]) - 100) < 1e-6
+b.remember(dict(quiet, sounds=[{"kind": "gun", "bearing": 2.0, "dist": "mid", "age": 0.0}]), 46.0, [0, 0, 0])
+assert b.hunters[5][1] == 45.0  # a sound from another way isn't it
+hit = {"type": "damaged", "amount": 45, "weapon": "gun", "bearing": math.pi / 2, "by": 9}
+b.remember(dict(quiet, events=[hit, dict(hit, by=104, weapon="npc")]), 47.0, [0, 0, 0])
+assert sorted(b.hunters) == [5, 9] and math.dist(b.hunters[9][0][:2], [0, 100]) < 1e-6
+b.remember(dict(quiet, events=[{"type": "kill", "target": 9}]), 48.0, [0, 0, 0])
+assert list(b.hunters) == [5]
+b.remember(quiet, 60.0, [0, 0, 0])  # HUNT_S after we last heard it
+assert b.hunters == {}
 # Upgrades: the drum magazine comes before the other gun upgrades (and armor), plating and laser_damage before it.
 gun = {"weapons": [{"kind": "gun"}, None], "upgrades": []}
 assert b.pick_upgrade(["gun_rate", "armor", "gun_mag"], gun) == 2
