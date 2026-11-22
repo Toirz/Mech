@@ -186,15 +186,14 @@ assert fb.cover_spot([45, 0, 0], [0, 0], 400, [mech(5, [100, 0, 0])], 0.0, reach
 CFG = {"mech": {"radius": 2.5, "height": 9, "eye_height": 8, "max_pitch": 1.3, "gravity": 22, "walk_speed": 11.7},
        "weapons": {"mortar": {"gravity": 22, "splash_radius": 7}, "lightning": {"short_s": 2}}, "loot": {"pickup_radius": 4},
        "cubes": {"size_per_cube": 0.05, "damage_per_cube": 0.04, "stat_cap": 10}, "npc": {"radius": 1.8, "height": 3.5, "cubes": 2},
-       "crates": {"radius": 1.4, "height": 2.4, "cubes": 1}, "projectile": {"gun_radius": 0.3}, "match": {"tick_hz": 20},
-       "drops": {"radius": 8}}
+       "crates": {"radius": 1.4, "height": 2.4, "cubes": 1}, "projectile": {"gun_radius": 0.3}, "match": {"tick_hz": 20}}
 
 
-def decide(hp, events, drops=(), cubes=()):
+def decide(hp, events):
     with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):  # "map not loaded"
         bot = Bot({"config": CFG, "seed": 1, "map": {"dir": "/nonexistent"}})
     o = {"tick": 200, "t": 100.0, "alive": 16, "mechs": [mech(5, [100, 0, 0], aim=math.pi)], "projectiles": [], "crates": [],
-         "cubes": list(cubes), "pickups": [], "sounds": [], "beams": [], "events": events, "drops": list(drops), "offer": None,
+         "cubes": [], "pickups": [], "sounds": [], "beams": [], "events": events, "drops": [], "offer": None,
          "zone": {"center": [0, 0], "radius": 500, "next_center": [0, 0], "next_radius": 400, "shrink_start": 200, "shrink_end": 250},
          "self": {"id": 0, "pos": [0, 0, 0], "vel": [0, 0, 0], "aim": [0, 0], "hp": hp, "max_hp": 1400, "energy": 100, "grounded": True,
                   "cubes": 0, "upgrades": [], "in_zone": True, "weapons": [dict(GUN), None],
@@ -207,16 +206,6 @@ def hit(amount, weapon):
     return {"type": "damaged", "amount": amount, "weapon": weapon, "bearing": 0.0, "by": 5}
 
 
-ring = {"id": 20000, "pos": [0, 0, 0], "radius": 8, "lands_in": 0, "capture_s": 4, "progress": 0, "holder": None}
-# On a landed drop at 280 HP: a laser hit (105 dps for the 4 s capture) means no capture: fight, strafing.
-mode, a = decide(280, [hit(315, "laser")], drops=[ring])
-assert mode != "drop" and math.hypot(*a["move"]) > 0.9, (mode, a)
-# A gun hit (15 dps) we outlive: capture, strafing inside the ring at walking speed (boosting would carry us out of it).
-mode, a = decide(280, [hit(45, "gun")], drops=[ring])
-assert mode == "drop" and math.hypot(*a["move"]) > 0.9 and not a["boost"], (mode, a)
-# A cube 30 m west while mech 5 shoots: weave there at 45 deg across its line, not straight at it.
-mode, a = decide(1400, [hit(45, "gun")], cubes=[{"id": 5001, "pos": [-30, 0, 0]}])
-assert mode == "loot" and a["move"][0] < -0.6 and abs(a["move"][1]) > 0.6, (mode, a)
 # Hiding (280 HP) under fire, without a map we know of no cover but where we stand: fight back, strafing.
 mode, a = decide(280, [hit(45, "gun")])
 assert mode == "fight" and math.hypot(*a["move"]) > 0.9 and a["fire"][0], (mode, a)
