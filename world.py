@@ -197,9 +197,28 @@ class World:
         n = int(math.dist(a[:2], b[:2]) / CELL) + 1
         return all(self.free(a[0] + (b[0] - a[0]) * k / n, a[1] + (b[1] - a[1]) * k / n) for k in range(n + 1))
 
-    def path(self, a, b, budget_s=0.01):
+    def danger_cells(self, spots, radius=60.0, peak=3.0):
+        """{nav cell: extra cost} around each (x, y, weight) in spots: peak x weight at the spot, falling to 0 at
+        radius. Paths given it as `extra` bend away from where the foes are."""
+        out = {}
+        s = CELL * NAV
+        k = int(radius // s) + 1
+        for x, y, w in spots:
+            ci = self.nav_cell(x, y)
+            I0, J0 = ci % self.mnx, ci // self.mnx
+            for J in range(max(J0 - k, 0), min(J0 + k + 1, self.mny)):
+                dy = (J - J0) * s
+                for I in range(max(I0 - k, 0), min(I0 + k + 1, self.mnx)):
+                    d = math.hypot((I - I0) * s, dy)
+                    if d < radius:
+                        c = J * self.mnx + I
+                        out[c] = out.get(c, 0.0) + peak * w * (1 - d / radius)
+        return out
+
+    def path(self, a, b, budget_s=0.01, extra=None):
         """Waypoints [[x, y], ...] from a toward b. If the time budget runs out, the path to the
-        explored cell closest to b (replanning later continues from there). [] = no progress."""
+        explored cell closest to b (replanning later continues from there). [] = no progress.
+        extra: {nav cell: added cost per step} (danger), or None."""
         mnx, mny, cost = self.mnx, self.mny, self.cost
         s, g = self.nav_cell(a[0], a[1]), self.nav_cell(b[0], b[1])
         if s == g:
@@ -235,6 +254,8 @@ class World:
                     c = cost[nb]
                     if dx and dy:  # no cutting corners past a wall
                         c = max(c, cost[cy * mnx + x], cost[y * mnx + cx])
+                    if extra:
+                        c += extra.get(nb, 0.0)
                     ng = gcur + d * c
                     if ng < gc.get(nb, 1e18):
                         gc[nb] = ng
