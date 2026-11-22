@@ -67,7 +67,7 @@ if os.path.isdir(arena):
 # Roaming heads for cells we haven't been to, inside the safe circle; hiding without a map stays put.
 b = Bot.__new__(Bot)
 b.rng, b.world, b.visited, b.roam, b.roam_t = random.Random(2), None, {}, None, -1e9
-b.threat, b.cover, b.cover_t, b.mech, b.cfg = None, None, -1e9, {"height": 9}, {"cubes": {}}
+b.threat, b.cover, b.cover_t, b.mech = None, None, -1e9, {"height": 9}
 for x in range(-200, 1, 40):  # the west half is freshly visited
     for y in range(-200, 201, 40):
         b.visited[(x // 40, y // 40)] = 100.0
@@ -77,7 +77,7 @@ assert b.roam_goal([1, 1, 0], [0, 0], 250, 101.0) == g  # keeps its waypoint unt
 assert b.cover_spot([5, 6, 0], [0, 0], 250, [{"pos": [50, 0, 0]}], 0.0) == [5, 6]
 # Farming: drones and crates we saw are remembered until we're close and they're gone; the trip worth most cubes per metre wins.
 b.cfg = {"npc": {"cubes": 2}, "crates": {"cubes": 1}}
-b.pickups, b.cubes, b.crates, b.npcs, b.dmg_in = {}, {}, {}, {}, []
+b.pickups, b.cubes, b.crates, b.npcs = {}, {}, {}, {}
 seen = {"pickups": [], "cubes": [], "events": [], "sounds": [], "crates": [{"id": 1000, "pos": [60, 0, 0], "hp": 300}],
         "mechs": [{"id": 100, "kind": "npc", "pos": [-100, 0, 0]}]}
 b.remember(seen, 10.0, [0, 0, 0])
@@ -118,9 +118,6 @@ class Walls:
     def ground_at(self, x, y):
         return 0.0
 
-    def free(self, x, y):
-        return True
-
 
 def fight_bot():
     fb = Bot.__new__(Bot)
@@ -129,7 +126,6 @@ def fight_bot():
     fb.mech = {"radius": 2.5, "height": 9, "eye_height": 8, "max_pitch": 1.3}
     fb.world, fb.pred, fb.t = Walls(), Predictor(22.0), 10.0
     fb.hit_by, fb.hit_on, fb.tid, fb.vhist, fb.short_until, fb.dbg = {}, {}, None, {}, 0.0, {}
-    fb.threat, fb.cover, fb.cover_t = None, None, -1e9
     return fb
 
 
@@ -176,37 +172,4 @@ assert fb.weapons(me, muz, muz, T, fb.t)[1][1] is False
 T["m"]["hp"] = 1400
 assert fb.weapons(me, muz, muz, T, fb.t)[1][1] is True
 assert abs(fb.laser_need(LASER, dict(T, m={"hp": 200}), me) - 0.573) < 0.001 and fb.laser_need(LASER, None, me) == 0.75
-# Cover: 5 m from the 5 m wall, a mech 55 m beyond it sees over it to our head: not cover. Behind the tall wall is (16 m off).
-fb = fight_bot()
-assert fb.cover_spot([45, 0, 0], [0, 0], 400, [mech(5, [100, 0, 0])], 0.0) == [45, 16]
-fb.cover_t = -1e9
-assert fb.cover_spot([45, 0, 0], [0, 0], 400, [mech(5, [100, 0, 0])], 0.0, reach=10) is None  # none within 10 m
-
-# Whole decisions (no map: straight lines, everything in the open). Mech 5 stands 100 m east, facing us.
-CFG = {"mech": {"radius": 2.5, "height": 9, "eye_height": 8, "max_pitch": 1.3, "gravity": 22, "walk_speed": 11.7},
-       "weapons": {"mortar": {"gravity": 22, "splash_radius": 7}, "lightning": {"short_s": 2}}, "loot": {"pickup_radius": 4},
-       "cubes": {"size_per_cube": 0.05, "damage_per_cube": 0.04, "stat_cap": 10}, "npc": {"radius": 1.8, "height": 3.5, "cubes": 2},
-       "crates": {"radius": 1.4, "height": 2.4, "cubes": 1}, "projectile": {"gun_radius": 0.3}, "match": {"tick_hz": 20}}
-
-
-def decide(hp, events):
-    with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):  # "map not loaded"
-        bot = Bot({"config": CFG, "seed": 1, "map": {"dir": "/nonexistent"}})
-    o = {"tick": 200, "t": 100.0, "alive": 16, "mechs": [mech(5, [100, 0, 0], aim=math.pi)], "projectiles": [], "crates": [],
-         "cubes": [], "pickups": [], "sounds": [], "beams": [], "events": events, "drops": [], "offer": None,
-         "zone": {"center": [0, 0], "radius": 500, "next_center": [0, 0], "next_radius": 400, "shrink_start": 200, "shrink_end": 250},
-         "self": {"id": 0, "pos": [0, 0, 0], "vel": [0, 0, 0], "aim": [0, 0], "hp": hp, "max_hp": 1400, "energy": 100, "grounded": True,
-                  "cubes": 0, "upgrades": [], "in_zone": True, "weapons": [dict(GUN), None],
-                  "stats": {"walk_speed": 11.7, "turn_rate": 4, "pitch_rate": 3, "muzzle_height": 7, "height": 9}}}
-    a = bot.act(o)
-    return __import__("mechfight").draw.take()["label"].split(" ")[0], a
-
-
-def hit(amount, weapon):
-    return {"type": "damaged", "amount": amount, "weapon": weapon, "bearing": 0.0, "by": 5}
-
-
-# Hiding (280 HP) under fire, without a map we know of no cover but where we stand: fight back, strafing.
-mode, a = decide(280, [hit(45, "gun")])
-assert mode == "fight" and math.hypot(*a["move"]) > 0.9 and a["fire"][0], (mode, a)
 print("ok")

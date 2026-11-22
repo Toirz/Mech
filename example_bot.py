@@ -36,7 +36,6 @@ DROP_RANGE = 250.0   # m: farthest we go for a supply drop (3 cubes, full HP and
 ROAM_CELL = 40.0     # m: cells of the visited map; roaming heads for the one we left longest ago
 ROAM_REPICK = 25.0   # s: give up on a roam waypoint after this
 HIDE_HP, HEALED_HP = 0.25, 0.9  # HP fraction: hide below the first, go back out at the second
-COVER_NEAR = 28.0    # m: hiding and still shot at, cover at most this far is worth the walk (else stand and trade)
 FIGHT_RANGE = 150.0  # m: a seen mech this close (or one shooting us) stops the roam: stand and strafe
 ROOF_Z = 3.0         # m above the terrain: an item this high is on a roof (a jump clears 2.75 m)
 ROOF_MAX = 45.0      # m: highest roof we jet up to for loot (100 energy climbs about 60 m)
@@ -165,7 +164,6 @@ class Bot:
         self.visited, self.roam, self.roam_t = {}, None, -1e9  # cell -> last t there; current waypoint
         self.hiding, self.cover, self.cover_t = False, None, -1e9
         self.climb = None                # roof loot: {p: item, t0}
-        self.dmg_in = []                 # (t, amount) of weapon damage we took in the last 3 s
         self.pred = Predictor(self.mech.get("gravity", 22), self.world.ground_at if self.world else None)
 
     # ----- memory -----
@@ -189,11 +187,9 @@ class Bot:
         seen_k, seen_n = {k["id"] for k in obs["crates"]}, {m["id"] for m in npcs}
         self.crates = {k: v for k, v in self.crates.items() if (k in seen_k or d2(v[0], pos) > 25) and t - v[1] < FARM_S}
         self.npcs = {k: v for k, v in self.npcs.items() if (k in seen_n or d2(v[0], pos) > 40) and t - v[1] < FARM_S}
-        self.dmg_in = [d for d in self.dmg_in if t - d[0] < 3]
         for e in obs["events"]:
             if e["type"] == "damaged" and e.get("bearing") is not None:
                 self.threat = (e["bearing"], t)
-                self.dmg_in.append((t, e["amount"]))
                 if e.get("rear"):
                     self.turn_to = (e["bearing"], t)
                 if e.get("by") is not None:
@@ -524,35 +520,34 @@ class Bot:
         self.roam, self.roam_t = best, t
         return best
 
-    def cover_spot(self, pos, c, r, enemies, t, height=None, reach=40.0):
-        """A walkable spot within `reach` m, inside the safe circle, where no known enemy's eye (nor that of a
-        shooter we only felt, assumed 80 m out along the hit's bearing) sees our middle or the top of our head,
-        at our `height` (cubes make us taller). Our own spot if nobody is known."""
-        eye, spc = self.mech.get("eye_height", 8.0), self.cfg["cubes"].get("size_per_cube", 0.05)
+    def cover_spot(self, pos, c, r, enemies, t):
+        """A walkable spot within 40 m, inside the safe circle, out of sight of every known enemy (and of a
+        shooter we only felt, assumed 80 m out along the hit's bearing). Our own spot if nobody is known."""
+        eye = self.mech.get("eye_height", 8.0)
         ws = sorted(enemies, key=lambda m: d2(m["pos"], pos))[:4]
-        watchers = [[m["pos"][0], m["pos"][1], m["pos"][2] + eye * (1 + spc * m.get("cubes", 0))] for m in ws]
+        watchers = [[m["pos"][0], m["pos"][1], m["pos"][2] + eye] for m in ws]
         if self.threat and t - self.threat[1] < 5:
             b = self.threat[0]
             watchers.append([pos[0] + 80 * math.cos(b), pos[1] + 80 * math.sin(b), pos[2] + eye])
         if not watchers or not self.world:
             return list(pos[:2])
-        h = height or self.mech["height"]
+        mid = self.mech["height"] / 2
 
         def hidden(p):
-            gz = self.world.ground_at(p[0], p[1])
-            return not any(self.los(w, [p[0], p[1], gz + z]) for w in watchers for z in (h / 2, h))
+            q = [p[0], p[1], self.world.ground_at(p[0], p[1]) + mid]
+            return not any(self.los(w, q) for w in watchers)
         if t - self.cover_t < 1.0:  # the search costs line-of-sight rays: redo it once a second (None included)
             return self.cover
-        if self.cover and d2(self.cover, pos) <= reach and hidden(self.cover):
+        if self.cover and hidden(self.cover):
             self.cover_t = t
             return self.cover
         rr = max(r - EDGE_MARGIN, 0.0)
-        for dist in (d for d in (0, 8, 16, 28, 40) if d <= reach):
+        for dist in (0, 8, 16, 28, 40):
             for i in range(12 if dist else 1):
                 a = i * math.pi / 6
                 p = [pos[0] + dist * math.cos(a), pos[1] + dist * math.sin(a)]
-                if (d2(p, c) < rr and self.world.free(*p)
-                        and all(d2(m["pos"], p) > d2(m["pos"], pos) - 5 for m in ws) and hidden(p)):  # not toward them
+                if (d2(p, c) < rr and self.world.free(*p) and hidden(p)
+                        and all(d2(m["pos"], p) > d2(m["pos"], pos) - 5 for m in ws)):  # not toward them
                     self.cover, self.cover_t = p, t
                     return p
         self.cover, self.cover_t = None, t
@@ -696,17 +691,9 @@ class Bot:
             early = self.early_laser(me, pos, enemies) if t < EARLY_S and not shot_at else None
             engaged = bool(T and T["kind"] == "mech" and T["los"]
                            and (T["d"] < FIGHT_RANGE or t - self.hit_by.get(T["id"], -1e9) < 3))
-            # shot by a mech we can see: stand and trade (running shows it our back, x1.5), unless we're hurt and cover is
-            # near: then walk into it facing them, shooting (legs and torso turn apart). Hide properly once it lets up.
+            # shot by a mech we can see: stand and trade (running shows it our back, x1.5); hide once it lets up
             under_fire = bool(T and T["kind"] == "mech" and T["los"] and t - self.hit_by.get(T["id"], -1e9) < 3)
-            hide = None
-            if self.hiding and not drop:
-                # under fire: only cover we walk to in half the time its fire leaves us, and at most COVER_NEAR away
-                taking = sum(a for _, a in self.dmg_in) / 3  # dps we are taking
-                cover_r = min(COVER_NEAR, st.get("walk_speed", 11.7) * me["hp"] / max(taking, 1.0) / 2) if under_fire else 40.0
-                hide = self.cover_spot(pos, c, r, enemies, t, st.get("height"), cover_r)
-                if under_fire and not (hide and 3 < d2(hide, pos) <= cover_r):
-                    hide = None  # none near (or we only think we're hidden where we stand): stand and trade
+            hide = self.cover_spot(pos, c, r, enemies, t) if self.hiding and not drop and not under_fire else None
             farm = self.farm_goal(me, pos, c, r, enemies) if hpf >= 0.6 and not self.hiding else None  # targets() shoots them from 0.6
             calm = (not self.hiding and hpf >= 0.6 and not shot_at and not engaged
                     and not any(d2(m["pos"], pos) < ROOF_CALM for m in enemies))
