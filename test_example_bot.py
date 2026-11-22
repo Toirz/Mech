@@ -77,7 +77,7 @@ assert b.roam_goal([1, 1, 0], [0, 0], 250, 101.0) == g  # keeps its waypoint unt
 assert b.cover_spot([5, 6, 0], [0, 0], 250, [{"pos": [50, 0, 0]}], 0.0) == [5, 6]
 # Farming: drones and crates we saw are remembered until we're close and they're gone; the trip worth most cubes per metre wins.
 b.cfg = {"npc": {"cubes": 2}, "crates": {"cubes": 1}}
-b.pickups, b.cubes, b.crates, b.npcs = {}, {}, {}, {}
+b.pickups, b.cubes, b.crates, b.npcs, b.ghosts, b.heard_n, b.heard = {}, {}, {}, {}, {}, 0, None
 seen = {"pickups": [], "cubes": [], "events": [], "sounds": [], "crates": [{"id": 1000, "pos": [60, 0, 0], "hp": 300}],
         "mechs": [{"id": 100, "kind": "npc", "pos": [-100, 0, 0]}]}
 b.remember(seen, 10.0, [0, 0, 0])
@@ -89,6 +89,22 @@ b.remember(dict(seen, crates=[], mechs=[]), 11.0, [55, 0, 0])  # at the crate an
 assert list(b.crates) == [] and list(b.npcs) == [100]
 b.remember(dict(seen, crates=[], mechs=[]), 200.0, [55, 0, 0])  # not seen for FARM_S: forgotten
 assert b.npcs == {}
+# Enemy map: mechs we saw or heard, the closest aimed at while there's nothing to shoot; expired after FACE_S, gone when
+# killed, and forgotten when within the near range in plain sight with nothing listed there.
+b.cfg.update(sound={"near": 60, "mid": 160, "range": {"gun": 320}, "bearing_noise_deg": 7}, vision={"near_range": 45})
+quiet = dict(seen, crates=[], mechs=[])
+b.remember(dict(quiet, sounds=[{"kind": "gun", "bearing": math.pi / 2, "dist": "mid", "age": 0.0}]), 20.0, [0, 0, 0])
+f = b.foe_spot([0, 0, 0])
+assert f and abs(f[0]) < 1 and 60 < f[1] < 160 and b.heard[2] == f[1], f  # heard north, in the mid class
+b.remember(dict(quiet, mechs=[{"id": 7, "kind": "mech", "pos": [30, 0, 0]}]), 21.0, [0, 0, 0])
+assert b.foe_spot([0, 0, 0]) == [30, 0, 0]  # the mech we see is closer than the sound
+b.remember(dict(quiet, events=[{"type": "kill", "target": 7}]), 22.0, [0, 0, 0])
+assert 7 not in b.ghosts
+b.remember(quiet, 30.0, [0, 0, 0])  # FACE_S after the sound: forgotten
+assert b.ghosts == {} and b.foe_spot([0, 0, 0]) is None
+b.ghosts = {3: {"pos": [20, 0, 0], "t": 29.0, "r": 0.0}, 4: {"pos": [100, 0, 0], "t": 29.0, "r": 0.0}}
+b.clear_ghosts([0, 0, 0], 30.0)
+assert list(b.ghosts) == [4]  # 20 m off in plain sight and not listed: gone; 100 m off: kept until it expires
 # Upgrades: the drum magazine comes before the other gun upgrades (and armor), plating and laser_damage before it.
 gun = {"weapons": [{"kind": "gun"}, None], "upgrades": []}
 assert b.pick_upgrade(["gun_rate", "armor", "gun_mag"], gun) == 2
