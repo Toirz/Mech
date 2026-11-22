@@ -35,7 +35,10 @@ KILL_MARGIN = 0.75   # share of a beam's damage sure to land: 3 armor upgrades t
 DROP_RANGE = 250.0   # m: farthest we go for a supply drop (3 cubes, full HP and energy)
 ROAM_CELL = 40.0     # m: cells of the visited map; roaming heads for the one we left longest ago
 ROAM_REPICK = 25.0   # s: give up on a roam waypoint after this
-HIDE_HP, HEALED_HP = 0.25, 0.9  # HP fraction: hide below the first, go back out at the second
+HIDE_HP, HEALED_HP = 0.15, 0.9  # hiding later scored no worse each time (0.45 -> 0.35 -> 0.25)  # HP fraction: hide below the first, go back out at the second
+FIGHT_LOOT = 35.0    # m: in a fight the strafe drifts onto a cube or wanted weapon this close (giddy, andrew-zhouu)
+KEEP_OFF = 80.0      # m: with a laser, back away from a mech closer than this (house guns: 85% hits < 40 m, 26% at 80-120 m)
+SEEK_S, SEEK_RANGE = 30.0, 320.0  # nothing else to do and healthy: go where a mech was seen this recently (andrew-zhouu)
 FIGHT_RANGE = 150.0  # m: a seen mech this close (or one shooting us) stops the roam: stand and strafe
 ROOF_Z = 3.0         # m above the terrain: an item this high is on a roof (a jump clears 2.75 m)
 ROOF_MAX = 45.0      # m: highest roof we jet up to for loot (100 energy climbs about 60 m)
@@ -157,6 +160,7 @@ class Bot:
         self.pickups = {}                # id -> (kind, pos, t seen)
         self.cubes = {}                  # id -> (pos, t seen)
         self.crates, self.npcs = {}, {}  # id -> (pos, t seen): what we can farm for cubes
+        self.seen = {}                   # mech id -> (pos, t seen): where to go looking for the next fight
         self.bad_pickups = {}            # id -> t until we stop trying it
         self.hit_by, self.hit_on = {}, {}  # id -> last time it damaged us / we damaged it
         self.tid = None                  # id of the target we shot at last decision (kept unless another is clearly better)
@@ -181,6 +185,9 @@ class Bot:
         for k in obs["crates"]:
             self.crates[k["id"]] = (k["pos"], t)
         npcs = [m for m in obs["mechs"] if m["kind"] == "npc"]
+        for m in obs["mechs"]:
+            if m["kind"] == "mech":
+                self.seen[m["id"]] = (m["pos"], t)
         for m in npcs:
             self.npcs[m["id"]] = (m["pos"], t)
         # Close by and not listed: destroyed (a drone 40 m off would be in sensor range unless a building is between).
@@ -196,6 +203,8 @@ class Bot:
                     self.hit_by[e["by"]] = t
             elif e["type"] == "hit":
                 self.hit_on[e["target"]] = t
+            elif e["type"] == "kill":
+                self.seen.pop(e["target"], None)
             elif e["type"] == "take_failed":
                 self.bad_pickups[e["id"]] = t + 5
                 if e["reason"] == "gone":
@@ -391,6 +400,20 @@ class Bot:
         lo = st.get("min_frac", 0.35)  # damage share at no charge, rising linearly to 1 at full
         return min(max((hp / dmg - lo) / (1 - lo) * st["charge"], st.get("min_charge", 0.15)), st["charge"])
 
+    def killable(self, T, me):
+        """T dies to what we have ready: one full beam, or four rounds within 60 m (both through full armor)."""
+        hp = T["m"].get("hp") if T and T["kind"] == "mech" and T["los"] else None
+        if hp is None:
+            return False
+        cu = self.cfg["cubes"]
+        mul = (1 + cu.get("damage_per_cube", 0.04) * min(me.get("cubes", 0), cu.get("stat_cap", 10))) * KILL_MARGIN
+        for w in me["weapons"]:
+            if w and w["kind"] == "laser" and w["cooldown"] <= 0.3 and T["d"] <= w["stats"]["range"] and hp <= w["stats"]["damage"] * mul:
+                return True
+            if w and w["kind"] == "gun" and w.get("ammo", 0) >= 4 and T["d"] <= 60 and hp <= 4 * w["stats"]["damage"] * mul:
+                return True
+        return False
+
     def point_at(self, T, tau, hgt):
         """T's predicted position after tau s, hgt m above its feet."""
         p, _ = self.pred.predict(T["id"], T["pos"], T["vel"], tau)
@@ -477,6 +500,37 @@ class Bot:
                     v = unit(pos[0] - land[0], pos[1] - land[1])
                     return (v if v != [0.0, 0.0] else [-p["vel"][1], p["vel"][0]]), "dodge shell"
         return None
+
+    def bullet_side(self, obs, me, pos):
+        """Unit vector away from where the first bullet to reach us within 0.7 s will pass (inside our radius + 1.1 m),
+        or None. The strafe turns that way instead of waiting for its timer (giddy and andrew-zhouu dodge like this)."""
+        s = 1 + self.cfg["cubes"].get("size_per_cube", 0.05) * me.get("cubes", 0)
+        reach, top, best = self.mech["radius"] * s + 1.1, self.mech["height"] * s, None
+        for p in obs["projectiles"]:
+            v = p["vel"]
+            v2 = v[0] * v[0] + v[1] * v[1]
+            if p["kind"] == "mortar" or v2 < 1:
+                continue
+            tc = ((pos[0] - p["pos"][0]) * v[0] + (pos[1] - p["pos"][1]) * v[1]) / v2
+            mx, my = p["pos"][0] + v[0] * tc - pos[0], p["pos"][1] + v[1] * tc - pos[1]
+            if (0 < tc <= 0.7 and math.hypot(mx, my) < reach and pos[2] - 0.6 < p["pos"][2] + v[2] * tc < pos[2] + top + 0.6
+                    and (best is None or tc < best[0])):
+                best = (tc, mx, my, v)
+        if not best:
+            return None
+        away = unit(-best[1], -best[2])
+        return away if away != [0.0, 0.0] else unit(-best[3][1], best[3][0])
+
+    def keep_off(self, move, me, T, pos):
+        """The strafe with a step back from T while it is inside KEEP_OFF and we hold a laser (it outranges their guns),
+        unless T is down to 30% (finish it). House-bot guns hit 85% inside 40 m, 52% at 40-80 m, 26% at 80-120 m
+        (andrew-zhouu, 1,457 shots in public lobbies); giddy holds 120 m with a laser."""
+        d = d2(T["pos"], pos)
+        hp = T["m"].get("hp", 1400) / max(T["m"].get("max_hp", 1400), 1)
+        if d >= KEEP_OFF or hp <= 0.3 or not any(w and w["kind"] == "laser" for w in me["weapons"]):
+            return move
+        back, k = unit(pos[0] - T["pos"][0], pos[1] - T["pos"][1]), min((KEEP_OFF - d) / 30, 1.0)
+        return unit(move[0] + back[0] * k, move[1] + back[1] * k)
 
     def free_edge_spot(self, pos, c, r):
         """edge_spot, kept inside the map (the first zone is bigger than it), slid along the circle to a walkable cell."""
@@ -575,6 +629,21 @@ class Bot:
         out = [p for pid, (kind, p, _) in self.pickups.items() if self.bad_pickups.get(pid, -1) < self.t and self.wants(kind, me)[0]]
         return out + ([p for p, _ in self.cubes.values()] if me["cubes"] < CUBE_KEEP else [])
 
+    def fight_loot(self, me, pos):
+        """The nearest wanted weapon or cube within FIGHT_LOOT on our level: a cube is +4% HP (healed) and damage now."""
+        return min((p for p in self.loot_items(me) if d2(p, pos) < FIGHT_LOOT and abs(p[2] - pos[2]) < 4),
+                   key=lambda p: d2(p, pos), default=None)
+
+    def seek_goal(self, pos, c, r, t):
+        """Where the nearest mech seen in the last SEEK_S was, inside the circle and within SEEK_RANGE. Practice points are
+        house bots killed, and waiting for the next one to walk into view wastes the time between visits. Got there and
+        it isn't: forgotten."""
+        for k, (p, ts) in list(self.seen.items()):
+            if t - ts > SEEK_S or (d2(p, pos) < 22 and t - ts > 0.5):
+                del self.seen[k]
+        return min((p for p, _ in self.seen.values() if d2(p, c) < r - 6 and d2(p, pos) < SEEK_RANGE),
+                   key=lambda p: d2(p, pos), default=None)
+
     def on_roof(self, p):
         """Up on a building: above the walkable surface (ground or bridge deck; under a deck a jet only hits it)."""
         w = self.world
@@ -663,7 +732,8 @@ class Bot:
             self.hiding = True
         elif hpf >= HEALED_HP:
             self.hiding = False
-        if self.hiding and not (T and T["kind"] == "mech" and (t - self.hit_by.get(T["id"], -1e9) < 5 or T["d"] < 40)):
+        finish = self.hiding and self.killable(T, me)  # a hunter left one shot from dead is a point: take it before hiding
+        if self.hiding and not finish and not (T and T["kind"] == "mech" and (t - self.hit_by.get(T["id"], -1e9) < 5 or T["d"] < 40)):
             # regen needs 5 s without dealing damage too: shoot only whoever is on us; a charge is held
             fire = [bool(w and w["kind"] == "laser" and w.get("charge", 0) > 0) for w in me["weapons"]]
 
@@ -693,8 +763,9 @@ class Bot:
                            and (T["d"] < FIGHT_RANGE or t - self.hit_by.get(T["id"], -1e9) < 3))
             # shot by a mech we can see: stand and trade (running shows it our back, x1.5); hide once it lets up
             under_fire = bool(T and T["kind"] == "mech" and T["los"] and t - self.hit_by.get(T["id"], -1e9) < 3)
-            hide = self.cover_spot(pos, c, r, enemies, t) if self.hiding and not drop and not under_fire else None
+            hide = self.cover_spot(pos, c, r, enemies, t) if self.hiding and not drop and not under_fire and not finish else None
             farm = self.farm_goal(me, pos, c, r, enemies) if hpf >= 0.6 and not self.hiding else None  # targets() shoots them from 0.6
+            seek = self.seek_goal(pos, c, r, t) if hpf >= 0.7 and not self.hiding else None
             calm = (not self.hiding and hpf >= 0.6 and not shot_at and not engaged
                     and not any(d2(m["pos"], pos) < ROOF_CALM for m in enemies))
             if self.climb and (t - self.climb["t0"] > ROOF_TIMEOUT or (me["grounded"] and not calm and not self.on_roof(pos))):
@@ -714,9 +785,11 @@ class Bot:
             elif self.climb:
                 goal, mode, arrive = self.climb["p"], "roof", 1.0
             elif engaged:
-                goal, mode = list(pos[:2]), "fight"  # stand and trade, strafing (running off loses fights)
+                goal, mode = self.fight_loot(me, pos) or list(pos[:2]), "fight"  # stand and trade, strafing onto any loot close by
             elif farm:
                 goal, mode, arrive = farm, "farm", 6.0  # cubes for the upgrades: shoot it, then pick them up as loot
+            elif seek:
+                goal, mode, arrive = seek, "seek", 6.0
             else:
                 roam = self.roam_goal(pos, c, r, t)
                 if roam:
@@ -745,9 +818,13 @@ class Bot:
                 if t >= self.strafe_until:
                     self.strafe_sign, self.strafe_until = -self.strafe_sign, t + self.rng.uniform(0.35, 0.9)  # reverse before their led shot lands
                 yaw = math.atan2(T["pos"][1] - y, T["pos"][0] - x) + self.strafe_sign * math.pi / 2
+                away = self.bullet_side(obs, me, pos)
+                if away and math.cos(yaw) * away[0] + math.sin(yaw) * away[1] < 0:  # a bullet will pass on the side we run to
+                    self.strafe_sign, self.strafe_until = -self.strafe_sign, t + self.rng.uniform(0.35, 0.9)
+                    yaw += math.pi
                 pull = min(gap / 6, 1.0)
                 to_spot = unit(goal[0] - x, goal[1] - y)
-                move = unit(math.cos(yaw) + to_spot[0] * pull, math.sin(yaw) + to_spot[1] * pull)
+                move = self.keep_off(unit(math.cos(yaw) + to_spot[0] * pull, math.sin(yaw) + to_spot[1] * pull), me, T, pos)
 
         # Stuck: commanded to move but not getting anywhere -> jump and jet; if that fails too, sidestep.
         # Not while fighting inside the zone (hopping about loses the fight); outside it the zone kills faster than they do.
@@ -782,7 +859,7 @@ class Bot:
                 aim = [self.threat[0], 0.0]
             elif self.heard and t - self.heard[1] < 2:
                 aim = [self.heard[0], 0.0]
-            elif mode in ("roam", "farm") and wants_move:  # scan: sweep +-1 rad across the way we walk
+            elif mode in ("roam", "farm", "seek") and wants_move:  # scan: sweep +-1 rad across the way we walk
                 aim = [math.atan2(move[1], move[0]) + math.sin(t * 2.0), 0.0]
             elif gap > 30 and wants_move:
                 aim = [math.atan2(move[1], move[0]), 0.0]
