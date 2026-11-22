@@ -39,6 +39,7 @@ LATENCY = 0.03       # s from an observation to the shot leaving (the action app
 GUN_TOL = 1.0        # m: the gun fires only when its aim is this close to the lead point, at the target
 GUN_MIN_P = 0.15     # the gun holds fire below this estimated hit chance
 LASER_MARGIN = 0.8   # m: the beam must point this far inside the target's edge when we let go
+PRE_HOLD = 1.0       # s a full charge may wait for a hunter coming round cover (the server fires it itself after 2 s)
 DROP_RANGE = 250.0   # m: farthest we go for a supply drop (3 cubes, full HP and energy)
 ROAM_CELL = 40.0     # m: cells of the visited map; roaming heads for the one we left longest ago
 ROAM_REPICK = 25.0   # s: give up on a roam waypoint after this
@@ -386,9 +387,10 @@ class Bot:
                     full = w["charge"] >= w["stats"]["charge"] - 0.05
                     on = aim_error(then, aims[i]) * dists[i] < T["r"] - LASER_MARGIN and off < T["r"] + 1.0
                     fire[i] = not (full and ok[i] and on)
-                else:  # start only if it will still be in the open when the charge is full
+                else:  # start only if it will still be in the open when the charge is full, or it's about to show
                     fire[i] = (ok[i] and w["cooldown"] <= 0 and err < 0.35
-                               and self.los(muzzle, self.point_at(T, w["stats"]["charge"], T["c"][2] - T["pos"][2])))
+                               and self.los(muzzle, self.point_at(T, w["stats"]["charge"], T["c"][2] - T["pos"][2]))
+                               or self.precharge(muzzle, T, w, t, me["vel"]))
             elif k == "lightning":
                 fire[i] = ok[i] and w["cooldown"] <= 0.1 and abs(ang_diff(now[0], aims[i][0])) < math.radians(w["stats"]["cone_deg"]) / 2 * 0.8
             elif k == "gun":  # on the lead point once the torso has slewed, and not wildly off now
@@ -404,6 +406,19 @@ class Bot:
         calm = T is None or T["kind"] != "mech"
         reload = bool(gun) and not gun.get("reload") and (gun.get("ammo", 1) == 0 or (calm and gun.get("ammo", 0) < gun["stats"]["mag"] / 2))
         return aim, fire, reload
+
+    def precharge(self, muzzle, T, w, t, vel):
+        """Charge the laser early for a hunter the server still tracks behind cover when its predicted path and ours
+        (at the half speed charging leaves us) open a line of fire within charge + PRE_HOLD s: the beam is ready the
+        moment it shows, while its own laser still needs its 0.75 s. The hold-and-release logic fires it once it is
+        in the open and on target."""
+        st = w["stats"]
+        if not (T["kind"] == "mech" and not T["los"] and T["id"] in self.hunters and w["cooldown"] <= 0
+                and t >= self.short_until and T["d"] <= st["range"]):
+            return False
+        mid, half = T["c"][2] - T["pos"][2], self.mech.get("charge_move_mult", 0.5)
+        return any(self.los([muzzle[0] + vel[0] * half * tau, muzzle[1] + vel[1] * half * tau, muzzle[2]], self.point_at(T, tau, mid))
+                   for tau in (k * 0.15 for k in range(1, int((st["charge"] + PRE_HOLD) / 0.15) + 1)))
 
     def point_at(self, T, tau, hgt):
         """T's predicted position after tau s, hgt m above its feet."""

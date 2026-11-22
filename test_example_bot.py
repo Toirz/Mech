@@ -110,6 +110,18 @@ b.remember(dict(quiet, events=[{"type": "kill", "target": 9}]), 48.0, [0, 0, 0])
 assert list(b.hunters) == [5]
 b.remember(quiet, 60.0, [0, 0, 0])  # HUNT_S after we last heard it
 assert b.hunters == {}
+# Pre-charge: the laser starts for a hunter the server tracks behind cover once its path brings it into the open soon
+# (no map here, so at once); not for a mech that isn't after us, one already in the open, on cooldown or shorted.
+from predict import Predictor
+b.pred, b.short_until, b.hunters = Predictor(22, None), 0.0, {5: [[100, 0, 0], 60.0]}
+T = {"id": 5, "kind": "mech", "los": False, "pos": [100, 0, 0], "c": [100, 0, 4.5], "vel": [0, 5, 0], "d": 100.0}
+laser = {"kind": "laser", "cooldown": 0.0, "charge": 0.0, "stats": {"charge": 0.75, "range": 280}}
+assert b.precharge([0, 0, 7], T, laser, 60.0, [0, 0, 0])
+assert not b.precharge([0, 0, 7], dict(T, id=6), laser, 60.0, [0, 0, 0])
+assert not b.precharge([0, 0, 7], dict(T, los=True), laser, 60.0, [0, 0, 0])
+assert not b.precharge([0, 0, 7], T, dict(laser, cooldown=1.0), 60.0, [0, 0, 0])
+b.short_until = 61.0
+assert not b.precharge([0, 0, 7], T, laser, 60.0, [0, 0, 0])
 # Upgrades: the drum magazine comes before the other gun upgrades (and armor), plating and laser_damage before it.
 gun = {"weapons": [{"kind": "gun"}, None], "upgrades": []}
 assert b.pick_upgrade(["gun_rate", "armor", "gun_mag"], gun) == 2
