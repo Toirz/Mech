@@ -114,4 +114,16 @@ assert g.foe_spot([0, 0, 0], 21.5) == [-15.0, math.sin(math.pi) * 15.0, 0]
 g.heard = None
 assert g.foe_spot([0, 0, 0], 21.5) == h["pos"]  # the heard step at 20 m beats the pair at 30 m and the far gunshot
 assert g.foe_spot([0, 0, 0], 40.0) is None
+# Strength: HP x cube damage bonus x firepower. Next to us at full HP with only the gun, a mech with 10 cubes and a
+# laser is strong (keep away), one at 30% HP with the gun is weak (run it down, while it is alone).
+g.cfg["cubes"] = {"damage_per_cube": 0.04, "stat_cap": 10}
+mine = g.strength(1400, 0, ["gun"])
+big, small = g.strength(1960, 10, ["gun", "laser"]), g.strength(420, 0, ["gun"])
+assert big > 1.4 * mine and small < 0.7 * mine and 0.7 * mine < g.strength(1400, 0, ["gun"]) < 1.4 * mine
+g.ghosts = {7: {"pos": [120, 0, 0], "t": 50.0, "r": 0.0, "s": big}, 8: {"pos": [-100, 0, 0], "t": 50.0, "r": 0.0, "s": small}}
+assert g.strong_spots(50.0, mine) == [[120, 0, 0]]
+assert g.chase_goal([0, 0, 0], [0, 0], 500, 50.0, mine, g.strong_spots(50.0, mine)) == [-100, 0, 0]
+g.ghosts[8]["pos"] = [100, 30, 0]  # the weak one next to the strong one: leave it
+assert g.chase_goal([0, 0, 0], [0, 0], 500, 50.0, mine, g.strong_spots(50.0, mine)) is None
+assert g.hunt_goal([0, 0, 0], [0, 0], 500, 50.0, mine) is None  # nor do we hunt the strong one
 print("ok")

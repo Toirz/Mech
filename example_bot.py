@@ -1,9 +1,14 @@
 """Bot: roam the safe circle hunting lasers, cubes and supply drops; hide to heal when hurt; fight with the right weapon.
 
 Priorities each decision (movement): dodge a shell > get back in the zone > capture a supply drop
-> hide out of sight (below HIDE_HP, until HEALED_HP) > get away from mechs near us (hurt) > a laser in the first minute
-> loot on the ground > loot on a roof (only when calm: from within FLY_RANGE, jet straight at it and drop onto it)
-> stand and strafe against a mech in a fight > go for a lone mech (healthy) > roam to the least recently visited cell.
+> hide out of sight (below HIDE_HP, until HEALED_HP) > get away from strong mechs (and, hurt, from any mech near us)
+> run down a weak mech (healthy) > a laser in the first minute > loot on the ground > loot on a roof (only when calm:
+from within FLY_RANGE, jet straight at it and drop onto it) > stand and strafe against a mech in a fight
+> go for a lone mech (healthy) > roam to the least recently visited cell.
+
+Strength = HP x cube damage bonus x firepower (best weapon + a third of the second), ours against each mech we see:
+above STRONG x ours it is strong: we keep AVOID_R away, skip loot near it and never shoot first; below WEAK x ours
+(few cubes, little HP, only a gun) it is weak: healthy, we hunt it down while it is alone.
 
 The enemy map: every mech we see, and every mech sound we hear (bearing and near/mid/far give a rough spot), goes on
 it; a mech that leaves our view stays where we lost it (a ghost) until we look there and it is gone.
@@ -50,6 +55,8 @@ FACE_S = 10.0        # s: an enemy seen or heard this recently is where we look 
 CROWD_R = 80.0       # m: mechs this close to an item guard it; healthy we take on one for it, never two
 EVADE_R = 100.0      # m: hurt, we walk away from any mech on the map this close
 HUNT_RANGE = 200.0   # m: healthy with nothing to loot, we go for a lone mech on the map this close
+STRONG, WEAK = 1.4, 0.7  # a mech this many times our strength is strong (avoid it) / weak (hunt it down)
+AVOID_R = 150.0      # m we keep away from a strong mech (it reaches us with a laser well past that, but rarely sees us)
 SWEEP, SWEEP_W = 1.2, 2.5  # rad either side of the way we face, and the sweep's rate (peak slew 3 rad/s; the torso does 4)
 GLANCE_EVERY = (5.0, 8.0)  # s between two looks behind
 GLANCE_S = 1.0       # s a look behind lasts (turning round takes 0.75 s at 4 rad/s)
@@ -199,7 +206,8 @@ class Bot:
         self.cubes = {k: v for k, v in self.cubes.items() if (k in seen_c or d2(v[0], pos) > 25) and t - v[1] < 60}
         for m in obs["mechs"]:
             if m["kind"] == "mech":
-                self.ghosts[m["id"]] = {"pos": list(m["pos"]), "t": t, "r": 0.0}
+                self.ghosts[m["id"]] = {"pos": list(m["pos"]), "t": t, "r": 0.0,
+                                        "s": self.strength(m.get("hp", self.mech["hp"]), m.get("cubes", 0), m.get("weapons") or ["gun"])}
         self.ghosts = {k: g for k, g in self.ghosts.items() if t - g["t"] < (GHOST_S if g["r"] == 0 else HEARD_S)}
         for e in obs["events"]:
             if e["type"] == "kill":
@@ -228,6 +236,26 @@ class Bot:
     def los(self, a, b):
         return self.world.clear(a, b) if self.world else True
 
+    def strength(self, hp, cubes, kinds):
+        """How much fight a mech has, to compare with ours: HP x its cube damage bonus x firepower (best weapon
+        plus a third of the second: a gun 0.5, a laser 1.0)."""
+        C = self.cfg["cubes"]
+        v = sorted((WEAPON_VALUE.get(k, 0.3) for k in kinds), reverse=True) + [0.0, 0.0]
+        return hp * (1 + C["damage_per_cube"] * min(cubes, C["stat_cap"])) * (v[0] + v[1] / 3)
+
+    def strong_spots(self, t, mine):
+        """Where the mechs we judged strong (over STRONG x our strength) were in the last FACE_S."""
+        return [g["pos"] for g in self.ghosts.values() if g.get("s") and g["s"] > STRONG * mine and t - g["t"] <= FACE_S]
+
+    def chase_goal(self, pos, c, r, t, mine, strong):
+        """The nearest mech we judged weak (under WEAK x our strength), seen in the last FACE_S within HUNT_RANGE and
+        inside the safe circle, alone (no other mech within CROWD_R of it, strong or not)."""
+        rr = max(r - EDGE_MARGIN, 0.0)
+        return min((g["pos"] for g in self.ghosts.values() if g.get("s") is not None and g["s"] < WEAK * mine
+                    and t - g["t"] <= FACE_S and d2(g["pos"], pos) < HUNT_RANGE and d2(g["pos"], c) < rr
+                    and self.crowd(g["pos"], t) <= 1 and not any(d2(q, g["pos"]) < CROWD_R for q in strong)),
+                   key=lambda q: d2(q, pos), default=None)
+
     def hear(self, s, pos, t):
         """Put a mech sound on the enemy map: along its bearing, at the middle of its distance class (capped by
         how far that kind carries), off by half the class plus the bearing noise. Near a spot already on the map
@@ -249,7 +277,7 @@ class Bot:
                 near["t"] = ts
             return d
         self.heard_n += 1
-        self.ghosts[("h", self.heard_n)] = {"pos": q, "t": ts, "r": u}
+        self.ghosts[("h", self.heard_n)] = {"pos": q, "t": ts, "r": u, "s": None}  # heard only: strength unknown
         return d
 
     def lost(self, pos, t, n=6):
@@ -306,10 +334,12 @@ class Bot:
         self.evade, self.evade_t = first, t
         return first
 
-    def hunt_goal(self, pos, c, r, t):
-        """The nearest lone mech on the map (no other within CROWD_R of it) within HUNT_RANGE, inside the safe circle."""
+    def hunt_goal(self, pos, c, r, t, mine=None):
+        """The nearest lone mech on the map (no other within CROWD_R of it) within HUNT_RANGE, inside the safe circle,
+        not one we judged strong."""
         rr = max(r - EDGE_MARGIN, 0.0)
-        spots = [g["pos"] for g in self.ghosts.values() if g["r"] <= 80 and d2(g["pos"], pos) < HUNT_RANGE and d2(g["pos"], c) < rr]
+        spots = [g["pos"] for g in self.ghosts.values() if g["r"] <= 80 and d2(g["pos"], pos) < HUNT_RANGE and d2(g["pos"], c) < rr
+                 and not (mine and g.get("s") and g["s"] > STRONG * mine)]
         return min((q for q in spots if self.crowd(q, t) <= 1), key=lambda q: d2(q, pos), default=None)
 
     def check_spot(self, pos, goal, t):
@@ -567,14 +597,14 @@ class Bot:
             return spots[n] if n < len(spots) else len(plan) + (UPGRADE_REST.index(u) if u in UPGRADE_REST else 99)
         return min(range(len(ids)), key=lambda i: rank(ids[i]))
 
-    def early_laser(self, me, pos, enemies, most=1):
+    def early_laser(self, me, pos, enemies, most=1, avoid=()):
         """In the first minute: the nearest laser seen within EARLY_RANGE (else a lightning) we want and can reach first."""
         for kind in ("laser", "lightning"):
             best = min(((d2(p, pos), p) for pid, (k, p, _) in self.pickups.items()
                         if k == kind and self.bad_pickups.get(pid, -1) < self.t and self.wants(k, me)[0]
                         and d2(p, pos) < EARLY_RANGE and abs(p[2] - pos[2]) < 4  # not on a roof
                         and not any(d2(m["pos"], p) < d2(p, pos) for m in enemies)  # nobody closer to it
-                        and self.crowd(p, self.t) <= most), default=None)
+                        and self.crowd(p, self.t) <= most and not any(d2(q, p) < CROWD_R for q in avoid)), default=None)
             if best:
                 return best[1]
         return None
@@ -712,10 +742,12 @@ class Bot:
         i = w._idx(p[0], p[1])
         return i >= 0 and p[2] - w.surf[i] > ROOF_Z
 
-    def loot_goal(self, me, pos, c, r, most=1):
-        """The nearest wanted loot on the ground (roof loot is roof_target's) that at most `most` mechs on the map guard."""
+    def loot_goal(self, me, pos, c, r, most=1, avoid=()):
+        """The nearest wanted loot on the ground (roof loot is roof_target's) that at most `most` mechs on the map guard
+        and no strong mech (`avoid`) is near."""
         return min((p for p in self.loot_items(me) if d2(p, c) < r - 6 and d2(p, pos) < LOOT_RANGE and not self.on_roof(p)
-                    and self.crowd(p, self.t) <= most), key=lambda p: d2(p, pos), default=None)
+                    and self.crowd(p, self.t) <= most and not any(d2(q, p) < CROWD_R for q in avoid)),
+                   key=lambda p: d2(p, pos), default=None)
 
     def roof_target(self, me, pos, c, r):
         """The nearest wanted loot up on a roof we have the energy to jet onto, or None."""
@@ -775,6 +807,7 @@ class Bot:
         elif hpf >= HEALED_HP:
             self.hiding = False
         healthy = not self.hiding and hpf >= HEALED_HP
+        mine = max(self.strength(me["hp"], me.get("cubes", 0), [w["kind"] for w in me["weapons"] if w]), 1.0)
         T = self.targets(obs, me, muzzle, hpf)  # no running off in the open: a laser hits a runner just the same
         if not healthy and T and T["kind"] != "mech" and t - self.hit_by.get(T["id"], -1e9) >= 3:
             T = None  # hurt: no farming crates or drones (regen needs 5 s without dealing damage)
@@ -789,8 +822,9 @@ class Bot:
             if T["kind"] == "mech" and not T["los"] and t - self.hit_by.get(T["id"], -1e9) >= 3:
                 aim = None  # behind cover there's no shot: look at the closest enemy we know of below (it may be this one)
 
-        if not healthy and not (T and T["kind"] == "mech" and (t - self.hit_by.get(T["id"], -1e9) < 5 or T["d"] < 40)):
-            # hurt, we start no fights (and regen needs 5 s without dealing damage): shoot only whoever is on us; a charge is held
+        strong_T = bool(T and T["kind"] == "mech" and ((self.ghosts.get(T["id"]) or {}).get("s") or 0) > STRONG * mine)
+        if (not healthy or strong_T) and not (T and T["kind"] == "mech" and (t - self.hit_by.get(T["id"], -1e9) < 5 or T["d"] < 40)):
+            # hurt (regen needs 5 s without dealing damage), or it's strong: we start no fight; shoot only whoever is on us; a charge is held
             fire = [bool(w and w["kind"] == "laser" and w.get("charge", 0) > 0) for w in me["weapons"]]
 
         # Movement goal.
@@ -805,12 +839,14 @@ class Bot:
         elif not me["in_zone"]:
             mode = "zone"
         else:
+            strong = self.strong_spots(t, mine)  # where the strong mechs we know of are: we keep away from them
             drop = None
             for dr in obs.get("drops", []):
                 dd = d2(dr["pos"], pos)
                 if (dr["holder"] in (None, me["id"]) and dd < DROP_RANGE and d2(dr["pos"], c) < r - 3
                         and dr["lands_in"] <= dd / st.get("walk_speed", 11.7) + 10
-                        and self.crowd(dr["pos"], t, 60) <= (1 if healthy else 0)):  # hurt: only an unguarded one
+                        and self.crowd(dr["pos"], t, 60) <= (1 if healthy else 0)  # hurt: only an unguarded one
+                        and not any(d2(q, dr["pos"]) < CROWD_R for q in strong)):
                     drop = dr
                     break
             most = 1 if healthy else 0  # mechs we take on for an item
@@ -821,13 +857,16 @@ class Bot:
             under_fire = bool(T and T["kind"] == "mech" and T["los"] and t - self.hit_by.get(T["id"], -1e9) < 3)
             near = [g["pos"] for g in self.ghosts.values() if d2(g["pos"], pos) < EVADE_R]  # seen or heard close by
             out = not self.hiding and (healthy or not near)  # hurt, we go for things only while the map is clear around us
-            loot = self.loot_goal(me, pos, c, r, most) if out else None
-            early = self.early_laser(me, pos, enemies, most) if t < EARLY_S and not shot_at and out else None
+            loot = self.loot_goal(me, pos, c, r, most, strong) if out else None
+            early = self.early_laser(me, pos, enemies, most, strong) if t < EARLY_S and not shot_at and out else None
             hide = self.cover_spot(pos, c, r, enemies, t) if self.hiding and not drop and not under_fire else None
-            evade = (self.evade_spot(pos, c, r, near, t) if not healthy and not self.hiding and near and not under_fire
+            # keep away from strong mechs near us; hurt, from any mech near us
+            threats = [q for q in strong if d2(q, pos) < AVOID_R] + ([] if healthy else near)
+            evade = (self.evade_spot(pos, c, r, threats, t) if threats and not self.hiding and not under_fire
                      and not drop else None)
+            chase = self.chase_goal(pos, c, r, t, mine, strong) if healthy and not evade else None
             calm = healthy and not shot_at and not engaged and self.crowd(pos, t, ROOF_CALM) == 0
-            hunt = self.hunt_goal(pos, c, r, t) if healthy and not (drop or early or loot) else None
+            hunt = self.hunt_goal(pos, c, r, t, mine) if healthy and not (drop or early or loot or chase) else None
             if self.climb and (t - self.climb["t0"] > ROOF_TIMEOUT or (me["grounded"] and not calm and not self.on_roof(pos))):
                 self.climb = None  # trouble while still on the ground: forget the roof
             if not self.climb and calm and not (drop or hide or early or loot):
@@ -839,7 +878,9 @@ class Bot:
             elif hide:
                 goal, mode, arrive = hide, "hide", 1.5
             elif evade:
-                goal, mode, arrive = evade, "evade", 3.0
+                goal, mode, arrive = evade, "evade" if not healthy else "avoid", 3.0
+            elif chase:
+                goal, mode, arrive = chase, "chase", 5.0  # a weak mech on its own: run it down
             elif early:
                 goal, mode, arrive = early, "laser", 1.0
             elif loot:
@@ -876,7 +917,7 @@ class Bot:
                 move = unit(down[0] - x, down[1] - y)
         if move is None:
             move = self.steer(pos, goal, t, force=self.stuck_since is not None and t - self.stuck_since > 1) if gap > arrive else [0.0, 0.0]
-            duel = engaged and mode in ("loot", "laser") and gap > 8  # trading shots on the way to an item: zigzag to it
+            duel = engaged and mode in ("loot", "laser", "chase") and gap > 8  # trading shots on the way: zigzag there
             if (mode in ("edge", "fight") or duel) and T and T["kind"] == "mech" and T["los"]:  # strafe across their line of fire
                 if t >= self.strafe_until:
                     self.strafe_sign, self.strafe_until = -self.strafe_sign, t + self.rng.uniform(0.35, 0.9)  # reverse before their led shot lands
