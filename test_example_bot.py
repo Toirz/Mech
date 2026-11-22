@@ -3,7 +3,7 @@ import math
 import os
 import random
 
-from example_bot import Bot, edge_spot, lead, mortar_aim, shell_landing, zone_at
+from example_bot import Bot, aim_at, edge_spot, lead, mortar_aim, shell_landing, zone_at
 
 zone = {"center": [0, 0], "radius": 500, "next_center": [100, 0], "next_radius": 300, "shrink_start": 60, "shrink_end": 110}
 assert zone_at(zone, 0) == ([0, 0], 500)
@@ -143,7 +143,7 @@ fb = fight_bot()
 # Only its head and shoulders show over the 5 m wall: it is a target in the open, and a full charge on them is let go.
 T = fb.targets({"mechs": [mech(5, [60, 0, 0])], "crates": [], "beams": []}, me, muz, 1.0)
 assert T["los"] and not fb.los(muz, T["c"])
-me["aim"] = list(__import__("example_bot").aim_at(muz, fb.beam_point(muz, T)))
+me["aim"] = list(aim_at(muz, fb.beam_point(muz, T)))
 assert fb.weapons(me, muz, muz, T, fb.t)[1] == [False, False]  # laser let go (the gun waits: its point is 1.8 m lower)
 # A 100 HP mech behind the tall wall 20 m off (its back to us) loses to the one in the open 100 m off that just shot us.
 fb.hit_by[7] = fb.t - 1
@@ -165,4 +165,11 @@ obs = {"mechs": [mech(7, [-100, 0, 0]), mech(8, [-90, 5, 0])], "crates": [], "be
 assert fb.targets(obs, me, muz, 1.0)["id"] == 7
 obs["mechs"][1]["hp"] = 400
 assert fb.targets(obs, me, muz, 1.0)["id"] == 8
+# The laser lets go once its charge kills through full armor (100 HP: at the 0.15 s minimum); 1400 HP waits for full.
+T = fb.targets({"mechs": [mech(9, [-60, 0, 0], hp=100)], "crates": [], "beams": []}, me, muz, 1.0)
+me["aim"], me["weapons"][1] = list(aim_at(muz, fb.beam_point(muz, T))), dict(LASER, charge=0.15)
+assert fb.weapons(me, muz, muz, T, fb.t)[1][1] is False
+T["m"]["hp"] = 1400
+assert fb.weapons(me, muz, muz, T, fb.t)[1][1] is True
+assert abs(fb.laser_need(LASER, dict(T, m={"hp": 200}), me) - 0.573) < 0.001 and fb.laser_need(LASER, None, me) == 0.75
 print("ok")

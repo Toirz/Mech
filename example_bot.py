@@ -31,6 +31,7 @@ LATENCY = 0.03       # s from an observation to the shot leaving (the action app
 GUN_TOL = 1.0        # m: the gun fires only when its aim is this close to the lead point, at the target
 GUN_MIN_P = 0.15     # the gun holds fire below this estimated hit chance
 LASER_MARGIN = 0.8   # m: the beam must point this far inside the target's edge when we let go
+KILL_MARGIN = 0.75   # share of a beam's damage sure to land: 3 armor upgrades take 24%
 DROP_RANGE = 250.0   # m: farthest we go for a supply drop (3 cubes, full HP and energy)
 ROAM_CELL = 40.0     # m: cells of the visited map; roaming heads for the one we left longest ago
 ROAM_REPICK = 25.0   # s: give up on a roam waypoint after this
@@ -329,9 +330,10 @@ class Bot:
         def slot(kind):
             return next((i for i, w in enumerate(ws) if w and w["kind"] == kind), None)
         g, la, li, mo = slot("gun"), slot("laser"), slot("lightning"), slot("mortar")
+        need = self.laser_need(ws[la], T, me) if la is not None else 0.0  # charge to let go at
         charging = la is not None and ws[la].get("charge", 0) > 0
         if charging:  # follow the gun's lead while it charges; on its point for the last 0.15 s and after
-            full = ws[la]["charge"] >= ws[la]["stats"]["charge"] - 0.15
+            full = ws[la]["charge"] >= need - 0.15
             p = la if (full or g is None or not ready(g)) and aims[la] else g if g is not None and ready(g) else la
         elif T and not T["los"]:
             p = mo if mo is not None and ready(mo) else None
@@ -357,12 +359,12 @@ class Bot:
             k, err = w["kind"], aim_error(now, aims[i])
             off = err * dists[i]  # meters off the aim point, at the target
             if k == "laser":
-                if w.get("charge", 0) > 0:  # hold until full and on target, then let go (it fires on release)
-                    full = w["charge"] >= w["stats"]["charge"] - 0.05
+                if w.get("charge", 0) > 0:  # hold until charged enough (full, or enough to kill) and on target, then let go
+                    full = w["charge"] >= need - 0.05
                     on = aim_error(then, aims[i]) * dists[i] < T["r"] - LASER_MARGIN and off < T["r"] + 1.0
                     fire[i] = not (full and ok[i] and on)
-                else:  # start only if some of it will still be in the open when the charge is full
-                    fire[i] = ok[i] and w["cooldown"] <= 0 and err < 0.35 and self.beam_point(muzzle, T, w["stats"]["charge"]) is not None
+                else:  # start only if some of it will still be in the open when it is charged
+                    fire[i] = ok[i] and w["cooldown"] <= 0 and err < 0.35 and self.beam_point(muzzle, T, need) is not None
             elif k == "lightning":
                 fire[i] = ok[i] and w["cooldown"] <= 0.1 and abs(ang_diff(now[0], aims[i][0])) < math.radians(w["stats"]["cone_deg"]) / 2 * 0.8
             elif k == "gun":  # on the lead point once the torso has slewed, and not wildly off now
@@ -378,6 +380,16 @@ class Bot:
         calm = T is None or T["kind"] != "mech"
         reload = bool(gun) and not gun.get("reload") and (gun.get("ammo", 1) == 0 or (calm and gun.get("ammo", 0) < gun["stats"]["mag"] / 2))
         return aim, fire, reload
+
+    def laser_need(self, w, T, me):
+        """Seconds of laser charge whose beam kills T even through full armor (a full charge if it can't)."""
+        st, cu = w["stats"], self.cfg["cubes"]
+        hp = T["m"].get("hp") if T else None
+        if hp is None:
+            return st["charge"]
+        dmg = st["damage"] * (1 + cu.get("damage_per_cube", 0.04) * min(me.get("cubes", 0), cu.get("stat_cap", 10))) * KILL_MARGIN
+        lo = st.get("min_frac", 0.35)  # damage share at no charge, rising linearly to 1 at full
+        return min(max((hp / dmg - lo) / (1 - lo) * st["charge"], st.get("min_charge", 0.15)), st["charge"])
 
     def point_at(self, T, tau, hgt):
         """T's predicted position after tau s, hgt m above its feet."""
