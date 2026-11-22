@@ -286,6 +286,7 @@ class Bot:
         gun only fires down a corridor that is clear around its actual path."""
         ws, now = me["weapons"], me["aim"]
         aims, ok, dists = [None, None], [False, False], [1.0, 1.0]
+        dt, vel = 1.0 / self.cfg["match"].get("tick_hz", 20), me.get("vel") or (0.0, 0.0, 0.0)
         if T:
             h = self.vhist.setdefault(T["id"], [])
             h[:] = [e for e in h if t - e[0] < 2.0] + [(t, T["vel"])]
@@ -297,23 +298,26 @@ class Bot:
                 if not w:
                     continue
                 k, st = w["kind"], w["stats"]
+                # A shot leaves on the next tick (the one after, if the cooldown holds it), from where those moves put us:
+                # each enemy bullet in the recorded match lines up with its shooter's spot one tick on, within 0.08 m.
+                o = [muzzle[j] + vel[j] * dt * (1 if w["cooldown"] <= dt + 1e-9 else 2) for j in range(3)]
                 if k == "gun":
-                    pt, p_hit = self._gun_dbg = self.gun_point(muzzle, T, w)
+                    pt, p_hit = self._gun_dbg = self.gun_point(o, T, w)
                     joined = T["kind"] != "mech" or t - max(self.hit_by.get(T["id"], -1e9), self.hit_on.get(T["id"], -1e9)) < 5
                     if pt:
-                        aims[i], dists[i] = aim_at(muzzle, pt), math.dist(muzzle, pt)
+                        aims[i], dists[i] = aim_at(o, pt), math.dist(o, pt)
                     ok[i] = (pt is not None and T["los"] and T["d"] <= (st["range"] if joined else GUN_OPEN) and w.get("ammo", 1) > 0
                              and not w.get("reload") and p_hit >= GUN_MIN_P)  # the gun misses a lot far off and its noise carries 320 m
                 elif k == "laser":
-                    pt = self.beam_point(muzzle, T)
+                    pt = self.beam_point(o, T)
                     if pt:
-                        aims[i], dists[i] = aim_at(muzzle, pt), math.dist(muzzle, pt)
+                        aims[i], dists[i] = aim_at(o, pt), math.dist(o, pt)
                     else:
-                        aims[i] = aim_at(muzzle, T["c"])
+                        aims[i] = aim_at(o, T["c"])
                     ok[i] = pt is not None and T["los"] and T["d"] <= st["range"] and t >= self.short_until
                 elif k == "lightning":
                     pt = self.point_at(T, LATENCY, T["c"][2] - T["pos"][2])
-                    aims[i], dists[i] = aim_at(muzzle, pt), math.dist(muzzle, pt)
+                    aims[i], dists[i] = aim_at(o, pt), math.dist(o, pt)
                     ok[i] = T["los"] and dists[i] <= st["range"] * 0.95 and me["energy"] >= st["energy"] + 5
                 elif k == "mortar":
                     # lead by its mean velocity over 2 s: a strafer's shell lands on the middle of its dance (aim-range tested)
@@ -344,7 +348,6 @@ class Bot:
         aim = aims[p] if p is not None else None
 
         # Where the torso will point when the shots leave: it slews toward `aim` first (turn_rate per tick).
-        dt = 1.0 / self.cfg["match"].get("tick_hz", 20)
         st_ = me["stats"]
         then = now
         if aim is not None:

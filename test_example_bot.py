@@ -172,4 +172,12 @@ assert fb.weapons(me, muz, muz, T, fb.t)[1][1] is False
 T["m"]["hp"] = 1400
 assert fb.weapons(me, muz, muz, T, fb.t)[1][1] is True
 assert abs(fb.laser_need(LASER, dict(T, m={"hp": 200}), me) - 0.573) < 0.001 and fb.laser_need(LASER, None, me) == 0.75
+# Shots leave on the next tick, from where that tick's move puts us: strafing at 19.5 m/s past a mech 90 m off, the gun
+# aims from 0.98 m along our way, 1.95 m when its cooldown holds the shot for a second tick.
+run = dict(me, weapons=[GUN, None], vel=[0, 19.5, 0])
+T = fb.targets({"mechs": [mech(4, [90, 0, 0])], "crates": [], "beams": []}, run, muz, 1.0)
+for cd, side in ((0.0, 0.975), (0.07, 1.95)):
+    run["weapons"][0] = dict(GUN, cooldown=cd)
+    yaw = fb.weapons(run, muz, muz, T, fb.t)[0][0]
+    assert abs(yaw - math.atan2(-side, 90)) < 0.002, (cd, yaw)
 print("ok")
