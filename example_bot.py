@@ -12,8 +12,9 @@ it; a mech that leaves our view stays where we lost it (a ghost) until we look t
 - HIDE_HP..HEALED_HP (hurt): start no fights; loot only what no mech on the map is near, and walk away from any mech
   we see or hear close by. Shot by one we can see: stand and trade.
 - below HIDE_HP: hide out of sight until back at HEALED_HP.
-With nothing to shoot we sweep left and right, glance behind every few seconds, and first look at any ghost near
-where we are going.
+Where we look: at what we can shoot; else always at the closest enemy we know of (one behind cover, one we lost or
+heard in the last FACE_S, the sound we just heard; whoever just hit us first); only knowing of none do we sweep left
+and right and glance behind every few seconds (looking first at any older ghost near where we are going).
 """
 import math
 import random
@@ -45,6 +46,7 @@ ROAM_REPICK = 25.0   # s: give up on a roam waypoint after this
 HIDE_HP, HEALED_HP = 0.25, 0.7  # HP fraction: below the first hide at once, until the second; below the second, start no fights
 GHOST_S = 30.0       # s we remember where a mech was when it left our view (the server tracks it for 5 s of that)
 HEARD_S = 10.0       # s we keep a spot we only heard (a moving mech makes a new sound every 0.6 s)
+FACE_S = 10.0        # s: an enemy seen or heard this recently is where we look while there's nothing to shoot
 CROWD_R = 80.0       # m: mechs this close to an item guard it; healthy we take on one for it, never two
 EVADE_R = 100.0      # m: hurt, we walk away from any mech on the map this close
 HUNT_RANGE = 200.0   # m: healthy with nothing to loot, we go for a lone mech on the map this close
@@ -164,7 +166,7 @@ class Bot:
         self.unstick_until, self.unstick_dir = -1.0, [0.0, 0.0]
         self.threat = None               # (bearing, t) of the last hit we took
         self.turn_to = None              # (bearing, t): hit in the back by someone we can't see: face that way a moment
-        self.heard = None                # (bearing, t, dist) of the last mech sound
+        self.heard = None                # (bearing, t, guessed m) of the closest mech sound we last heard
         self.strafe_sign, self.strafe_until = 1, 0.0
         self.burn = True  # boosting in a fight: on until energy drops to 25, back on at 70
         self.vhist = {}  # target id -> [(t, its velocity)] over the last 2 s
@@ -218,12 +220,10 @@ class Bot:
                 self.pickups.pop(e["id"], None)
             elif e["type"] == "effect" and e["effect"] == "short":
                 self.short_until = t + self.cfg["weapons"]["lightning"].get("short_s", 2)
-        sounds = [s for s in obs["sounds"] if s["kind"] in MECH_SOUNDS]
-        for s in sounds:
-            self.hear(s, pos, t)
-        if sounds:
-            s = min(sounds, key=lambda s: (["near", "mid", "far"].index(s["dist"]), s["age"]))
-            self.heard = (s["bearing"], t - s["age"], s["dist"])
+        heard = [(self.hear(s, pos, t), s) for s in obs["sounds"] if s["kind"] in MECH_SOUNDS]
+        if heard:
+            d, s = min(heard, key=lambda e: (e[0], e[1]["age"]))
+            self.heard = (s["bearing"], t - s["age"], d)
 
     def los(self, a, b):
         return self.world.clear(a, b) if self.world else True
@@ -231,7 +231,7 @@ class Bot:
     def hear(self, s, pos, t):
         """Put a mech sound on the enemy map: along its bearing, at the middle of its distance class (capped by
         how far that kind carries), off by half the class plus the bearing noise. Near a spot already on the map
-        it moves that spot (a listed mech made it: nothing to learn)."""
+        it moves that spot (a listed mech made it: nothing to learn). Returns the guessed distance."""
         S = self.cfg["sound"]
         reach = S["range"].get(s["kind"], S["mid"])
         lo, hi = {"near": (0.0, S["near"]), "mid": (S["near"], S["mid"])}.get(s["dist"], (S["mid"], max(reach, S["mid"])))
@@ -247,9 +247,10 @@ class Bot:
                 if u < near["r"] + 6.0 * (ts - near["t"]):  # the sound pins it down better than the old spot
                     near["pos"], near["r"] = q, u
                 near["t"] = ts
-            return
+            return d
         self.heard_n += 1
         self.ghosts[("h", self.heard_n)] = {"pos": q, "t": ts, "r": u}
+        return d
 
     def lost(self, pos, t, n=6):
         """The n nearest spots on the map of mechs not listed now (lost from view, or only heard)."""
@@ -319,6 +320,15 @@ class Bot:
                     and self.los(eye, [q[0], q[1], q[2] + self.mech["height"] / 2]):
                 return q
         return None
+
+    def foe_spot(self, pos, t):
+        """Where the closest enemy we know of is: a mech listed now (in view, or tracked behind cover), one we lost or
+        heard in the last FACE_S, or the sound we just heard; None if we know of none."""
+        spots = [g["pos"] for g in self.ghosts.values() if t - g["t"] <= FACE_S]
+        if self.heard and t - self.heard[1] < 2:  # the sound itself too: on the map it may have joined another spot
+            b, d = self.heard[0], self.heard[2]
+            spots.append([pos[0] + d * math.cos(b), pos[1] + d * math.sin(b), pos[2]])
+        return min(spots, key=lambda q: d2(q, pos), default=None)
 
     def look(self, base, t):
         """Scan with nothing to shoot: sweep SWEEP either side of base, and every few seconds a look behind."""
@@ -773,6 +783,11 @@ class Bot:
                                                               and t - self.hit_by[T["id"]] < 1.0):
             aim = [self.turn_to[0], 0.0]  # hit in the back (x1.5) by someone we don't have in front of us: turn round now
             fire = [bool(w and w["kind"] == "laser" and w.get("charge", 0) > 0) for w in me["weapons"]]  # nothing leaves off-aim; a charge is held
+            why = "turn"
+        elif aim is not None:
+            why = "target"
+            if T["kind"] == "mech" and not T["los"] and t - self.hit_by.get(T["id"], -1e9) >= 3:
+                aim = None  # behind cover there's no shot: look at the closest enemy we know of below (it may be this one)
 
         if not healthy and not (T and T["kind"] == "mech" and (t - self.hit_by.get(T["id"], -1e9) < 5 or T["d"] < 40)):
             # hurt, we start no fights (and regen needs 5 s without dealing damage): shoot only whoever is on us; a charge is held
@@ -896,31 +911,33 @@ class Bot:
             self.burn = me["energy"] > 70 if not self.burn else me["energy"] > 25
             boost = boost or (self.burn and me["grounded"])
 
-        # Where to look when there's nothing to shoot.
+        # Where to look when there's nothing to shoot: at the enemy whenever we know of one; else look round.
         if aim is None:
-            chk = self.check_spot(pos, goal, t)
-            if t < 1.6:  # a full turn at spawn (turn_rate 4 rad/s): see the loot behind us too
-                aim = [me["aim"][0] + 1.0, 0.0]
-            elif self.threat and t - self.threat[1] < 3:  # turn to face whoever hit us
-                aim = [self.threat[0], 0.0]
-            elif self.heard and t - self.heard[1] < 2:
-                aim = [self.heard[0], 0.0]
-            elif chk:  # a mech we lost near where we're going: is it still there?
-                aim = [math.atan2(chk[1] - y, chk[0] - x), 0.0]
+            foe = self.foe_spot(pos, t)
+            chk = None if foe else self.check_spot(pos, goal, t)
+            if self.threat and t - self.threat[1] < 3:  # turn to face whoever hit us
+                aim, why = [self.threat[0], 0.0], "hit"
+            elif foe:  # the closest mech we see behind cover, lost or heard
+                aim, why = [math.atan2(foe[1] - y, foe[0] - x), 0.0], "enemy"
+            elif t < 1.6:  # a full turn at spawn (turn_rate 4 rad/s): see the loot behind us too
+                aim, why = [me["aim"][0] + 1.0, 0.0], "spawn"
+            elif chk:  # an older ghost near where we're going: is it still there?
+                aim, why = [math.atan2(chk[1] - y, chk[0] - x), 0.0], "ghost"
             else:
                 lost = self.lost(pos, t, 1)
                 base = (math.atan2(move[1], move[0]) if math.hypot(*move) > 0.1
                         else math.atan2(lost[0][1] - y, lost[0][0] - x) if self.hiding and lost
                         else math.atan2(c[1] - y, c[0] - x))  # walking: the way we go; standing: the danger, else inward
                 aim = [self.look(base, t), 0.0]
+                why = "glance" if t < self.glance_until else "scan"
 
         act.update(move=move, boost=boost, jump=jump, aim=aim, fire=fire, reload=reload)
         if DEBUG and obs["tick"] % 200 == 0 and self.dbg:
             mf.log("gun", sorted(self.dbg.items()))
-        self.draw(pos, muzzle, goal, T, mode, me)
+        self.draw(pos, muzzle, goal, T, mode, me, why)
         return act
 
-    def draw(self, pos, muzzle, goal, T, mode, me):
+    def draw(self, pos, muzzle, goal, T, mode, me, why):
         x, y, z = pos
         prev = [x, y, z + 1]
         for wp in self.path[:8]:
@@ -930,7 +947,7 @@ class Bot:
         mf.draw.point([goal[0], goal[1], z], "#40c0ff", 6)
         if T:
             mf.draw.line(muzzle, T["c"], "#ff5040" if T["los"] else "#806060")
-        mf.draw.label(f"{mode} · hp {me['hp']:.0f} · {T['kind'] + ' ' + str(T['id']) if T else '-'}")
+        mf.draw.label(f"{mode} · hp {me['hp']:.0f} · {T['kind'] + ' ' + str(T['id']) if T else '-'} · eye {why}")
 
 
 if __name__ == "__main__":

@@ -107,4 +107,11 @@ assert e[0] < 0 and math.dist(e, h["pos"][:2]) > 50, e
 assert g.hunt_goal([0, 0, 0], [0, 0], 500, 21.0) == h["pos"]  # the far gunshot is too rough to go after
 g.ghosts[("h", 99)] = {"pos": [30, 10, 0], "t": 21.0, "r": 0.0}
 assert g.hunt_goal([0, 0, 0], [0, 0], 500, 21.0) is None  # two together: leave them
+# Looking: with nothing to shoot we face the closest enemy we know of (fresh on the map, or the sound just heard);
+# knowing of none (all older than FACE_S), we scan.
+g.heard = (math.pi, 21.0, 15.0)  # a step 15 m behind us
+assert g.foe_spot([0, 0, 0], 21.5) == [-15.0, math.sin(math.pi) * 15.0, 0]
+g.heard = None
+assert g.foe_spot([0, 0, 0], 21.5) == h["pos"]  # the heard step at 20 m beats the pair at 30 m and the far gunshot
+assert g.foe_spot([0, 0, 0], 40.0) is None
 print("ok")
