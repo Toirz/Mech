@@ -5,10 +5,11 @@ Priorities each decision (movement): dodge a shell > get back in the zone > capt
 > run down a weak mech (healthy) > a laser in the first minute > loot on the ground > loot on a roof (only when calm:
 from within FLY_RANGE, jet straight at it and drop onto it) > stand and strafe against a mech in a fight
 > go for a lone mech (healthy) > roam to the least recently visited cell.
-Everywhere, the safety map (from how many of 24 directions each 4 m cell has an open line of fire, 25-200 m out;
-trees don't stop shots) keeps us on safe ground: walks
-take paths that charge for exposed cells, roam waypoints and edge spots are never red (seen from RED+ directions)
-when there is another choice, and loot in the open counts as farther.
+
+The opening (until OPENING_S, when the first circle has closed): pick the safest spot near the spawn (open to fire
+from few directions on the safety map, a wall corner if it can be, inside the next circle) and settle there, grabbing
+only what's on the way; then loot within AROUND_R of it and come back to it. Caught in the open by a mech, we make
+for safe ground (zigzagging, shooting) instead of standing to trade there; no hunting, chasing or roof trips yet.
 
 Strength = HP x cube damage bonus x firepower (best weapon + a third of the second), ours against each mech we see:
 above STRONG x ours it is strong: we keep AVOID_R away, skip loot near it and never shoot first; below WEAK x ours
@@ -67,12 +68,12 @@ SWEEP, SWEEP_W = 1.2, 2.5  # rad either side of the way we face, and the sweep's
 GLANCE_EVERY = (5.0, 8.0)  # s between two looks behind
 GLANCE_S = 1.0       # s a look behind lasts (turning round takes 0.75 s at 4 rad/s)
 SILENT = 0.4         # move length that keeps us under step_speed (5 m/s): no step sounds
-RED = 19             # a cell open to fire from this many of 24 directions or more is red: no roaming to it, no edge spot on it
-MOVE_SAFE_W = 3.0    # extra A* cost per 4 m step, walking anywhere, through a cell seen from all 24 directions
-                     # (paths 60-220 m: 14% -> 9% of the way on red cells, no longer; weighted A* needs > 2.5 to care)
-ROAM_EXPO = 4.0      # s of roam score per direction a roam waypoint can be seen from
-LOOT_EXPO = 4.0      # m added to an item's distance per direction its cell can be seen from
-EDGE_SLIDE = 60.0    # m along the zone edge we look for the safest edge spot
+OPENING_S = 110.0    # s: the opening, until the first circle has closed (hold 60 s + shrink 50 s)
+ANCHOR_R = 120.0     # m around us where the opening's safe spot is looked for
+SAFE_MAX = 8         # a cell open to fire from at most this many of 24 directions is safe ground
+UNSAFE = 14          # from this many on it is exposed: in the opening we don't stand and trade shots there
+AROUND_R = 80.0      # m around the safe spot we loot in the opening (while getting there: only what's within 30 m)
+COVER_R = 40.0       # m: caught in the open in the opening, we make for safe ground this close (else for our spot)
 HIDE_R = 60.0        # m: hiding spots are looked for this far around us (4 m cells)
 HIDE_EVERY = 2.0     # s between two searches for a hiding spot
 HIDE_CHECK = (24, 0.006)  # at most this many spots, or s, of line-of-sight checks per search
@@ -180,15 +181,14 @@ class Bot:
         cfg = self.cfg = hello["config"]
         self.mech = cfg["mech"]
         self.rng = random.Random(hello["seed"])
-        self.world, self.move_costs = None, None
+        self.world = None
         try:
             self.world = World(hello["map"]["dir"], self.mech)
             if self.world.load_safety(os.path.join(os.path.dirname(os.path.abspath(__file__)), "safety.json")) is None:
                 mf.log("no safety map for this map: hiding by sight lines and walls only")
-            self.move_costs = self.world.safe_costs(MOVE_SAFE_W)  # every walk keeps to safe ground where it can
         except Exception as e:  # without the map we still play: straight lines, no cover checks
             mf.log(f"map not loaded, playing without it: {e!r}")
-        self.path, self.path_goal, self.path_t, self.path_kind = [], None, -1e9, None
+        self.path, self.path_goal, self.path_t, self.path_safe = [], None, -1e9, False
         self.hide_dbg = []               # the hiding spots the last search weighed: [spot, score, out of sight / None]
         self.hist = []                   # (t, x, y, wanted to move)
         self.stuck_since = None
@@ -207,6 +207,7 @@ class Bot:
         self.dbg = {}
         self.visited, self.roam, self.roam_t = {}, None, -1e9  # cell -> last t there; current waypoint
         self.hiding, self.cover, self.cover_t = False, None, -1e9
+        self.anchor, self.anchored = None, False  # the opening's safe spot, and whether we have got there
         self.ghosts = {}                 # the enemy map: mech id (seen) or ("h", n) (heard) -> {pos, t, r: how far off it may be}
         self.glance_next, self.glance_until, self.glance_side = 3.0, -1.0, 1
         self.heard_n = 0                 # keys of heard spots on the map: ("h", n)
@@ -623,12 +624,14 @@ class Bot:
             return spots[n] if n < len(spots) else len(plan) + (UPGRADE_REST.index(u) if u in UPGRADE_REST else 99)
         return min(range(len(ids)), key=lambda i: rank(ids[i]))
 
-    def early_laser(self, me, pos, enemies, most=1, avoid=()):
-        """In the first minute: the nearest laser seen within EARLY_RANGE (else a lightning) we want and can reach first."""
+    def early_laser(self, me, pos, enemies, most=1, avoid=(), around=None):
+        """In the first minute: the nearest laser seen within EARLY_RANGE (or within around = (centre, radius)), else
+        a lightning, that we want and can reach first."""
+        a, ar = around or (pos, EARLY_RANGE)
         for kind in ("laser", "lightning"):
             best = min(((d2(p, pos), p) for pid, (k, p, _) in self.pickups.items()
                         if k == kind and self.bad_pickups.get(pid, -1) < self.t and self.wants(k, me)[0]
-                        and d2(p, pos) < EARLY_RANGE and abs(p[2] - pos[2]) < 4  # not on a roof
+                        and d2(p, a) < ar and abs(p[2] - pos[2]) < 4  # not on a roof
                         and not any(d2(m["pos"], p) < d2(p, pos) for m in enemies)  # nobody closer to it
                         and self.crowd(p, self.t) <= most and not any(d2(q, p) < CROWD_R for q in avoid)), default=None)
             if best:
@@ -647,39 +650,23 @@ class Bot:
                     return (v if v != [0.0, 0.0] else [-p["vel"][1], p["vel"][0]]), "dodge shell"
         return None
 
-    def expo_at(self, p):
-        """How many of 24 directions the cell at p can be seen from (the safety map), or None."""
-        w = self.world
-        if not w or not w.expo:
-            return None
-        e = w.expo[w.nav_cell(p[0], p[1])]
-        return e if e <= 24 else None
-
     def free_edge_spot(self, pos, c, r):
-        """edge_spot, kept inside the map (the first zone is bigger than it), slid along the circle to a walkable cell:
-        with the safety map, the safest one within EDGE_SLIDE m along the edge (a red one only if there's nothing else)."""
+        """edge_spot, kept inside the map (the first zone is bigger than it), slid along the circle to a walkable cell."""
         spot = edge_spot(pos, c, r, EDGE_MARGIN)
         if not self.world:
             return spot
         spot = self.world.clamp(spot, MAP_MARGIN)
+        if self.world.free(*spot):
+            return spot
         base = math.atan2(spot[1] - c[1], spot[0] - c[0])
         rr = max(r - EDGE_MARGIN, 0.0)
-        da = min(0.05, 4 / max(rr, 1))  # about a 4 m cell along the circle
-        best, bs = None, None
-        for k in range(0, 40):
-            for s in ((1, -1) if k else (1,)):
-                p = spot if not k else self.world.clamp([c[0] + math.cos(base + s * k * da) * rr, c[1] + math.sin(base + s * k * da) * rr], MAP_MARGIN)
-                if not self.world.free(*p):
-                    continue
-                e = self.expo_at(p)
-                if e is None:
-                    return p  # no safety map: the nearest walkable one, as always
-                sc = (e if e < RED else 100 + e) + k * da * rr / 10
-                if bs is None or sc < bs:
-                    best, bs = p, sc
-            if best is not None and k * da * rr > EDGE_SLIDE:
-                break
-        return best or spot
+        for k in range(1, 40):
+            for s in (1, -1):
+                a = base + s * k * min(0.05, 4 / max(rr, 1))
+                p = self.world.clamp([c[0] + math.cos(a) * rr, c[1] + math.sin(a) * rr], MAP_MARGIN)
+                if self.world.free(*p):
+                    return p
+        return spot
 
     def roam_goal(self, pos, c, r, t):
         """A walkable waypoint inside the safe circle, in the cell we have been away from longest
@@ -697,15 +684,51 @@ class Bot:
                 p = self.world.clamp(p, MAP_MARGIN)
                 if not self.world.free(*p):
                     continue
-            e = self.expo_at(p) or 0
-            if d2(p, c) >= rr or d2(p, pos) < 30 or e >= RED:  # never roam to a red cell
+            if d2(p, c) >= rr or d2(p, pos) < 30:
                 continue
-            s = (self.visited.get((int(p[0] // ROAM_CELL), int(p[1] // ROAM_CELL)), -300.0) + d2(p, pos) / 10  # 10 m ~ 1 s
-                 + ROAM_EXPO * e)  # a safe waypoint over an exposed one
+            s = self.visited.get((int(p[0] // ROAM_CELL), int(p[1] // ROAM_CELL)), -300.0) + d2(p, pos) / 10  # 10 m ~ 1 s
             if bs is None or s < bs:
                 best, bs = p, s
         self.roam, self.roam_t = best, t
         return best
+
+    def expo_at(self, p):
+        """From how many of 24 directions the cell at p is open to fire (the safety map), or None."""
+        w = self.world
+        if not w or not w.expo:
+            return None
+        e = w.expo[w.nav_cell(p[0], p[1])]
+        return e if e <= 24 else None
+
+    def cells(self, pos, radius):
+        """(nav cell, its centre) for every walkable 4 m cell within radius of pos."""
+        w, S = self.world, CELL * NAV
+        for J in range(max(int((pos[1] - radius - w.y0) // S), 0), min(int((pos[1] + radius - w.y0) // S), w.mny - 1) + 1):
+            for I in range(max(int((pos[0] - radius - w.x0) // S), 0), min(int((pos[0] + radius - w.x0) // S), w.mnx - 1) + 1):
+                i = J * w.mnx + I
+                p = [w.x0 + (I + 0.5) * S, w.y0 + (J + 0.5) * S]
+                if w.cost[i] <= 1.0 and d2(p, pos) <= radius:
+                    yield i, p
+
+    def anchor_spot(self, pos, c, r, nc, nr):
+        """The opening's safe spot within ANCHOR_R: walkable, inside the safe circle, the best by directions open to
+        fire + 4 if not a wall corner + m away / 10 + 20 if outside the next circle (nc, nr). None without a map."""
+        w = self.world
+        if not w or not w.expo:
+            return None
+        rr, nrr, best, bs = max(r - EDGE_MARGIN, 0.0), max(nr - EDGE_MARGIN, 0.0), None, None
+        for i, p in self.cells(pos, ANCHOR_R):
+            if w.expo[i] > 24 or d2(p, c) >= rr:
+                continue
+            sc = w.expo[i] + (0 if CORNER[w.walls[i]] == 2 else 4) + d2(p, pos) / 10 + (20 if d2(p, nc) >= nrr else 0)
+            if bs is None or sc < bs:
+                best, bs = p, sc
+        return best
+
+    def safe_near(self, pos, radius):
+        """The nearest walkable safe cell (open to fire from SAFE_MAX directions or fewer) within radius, or None."""
+        w = self.world
+        return min((p for i, p in self.cells(pos, radius) if w.expo[i] <= SAFE_MAX), key=lambda p: d2(p, pos), default=None)
 
     def hide_spot(self, pos, c, r, t):
         """Where to hide: a walkable spot within HIDE_R, inside the safe circle, with a wall or the terrain between it and
@@ -776,16 +799,14 @@ class Bot:
             return SAFE_W * e / 24 + sum(4.0 * max(0.0, 1 - math.hypot(x - q[0], y - q[1]) / DANGER_R) for q in spots)
         return extra
 
-    def steer(self, pos, goal, t, force=False, extra=None, safe=True):
-        """Unit move vector toward goal along an A* path: on safe ground where it can (the safety map's move costs)
-        unless not `safe`, with `extra` step costs if given (see World.path)."""
+    def steer(self, pos, goal, t, force=False, extra=None):
+        """Unit move vector toward goal along an A* path (with `extra` step costs, see World.path)."""
         if not self.world:
             return unit(goal[0] - pos[0], goal[1] - pos[1])
-        kind = "extra" if extra else "safe" if safe and self.move_costs else "plain"
         if (force or not self.path or self.path_goal is None or d2(goal, self.path_goal) > 6 or t - self.path_t > 2.5
-                or kind != self.path_kind):
-            self.path = self.world.path(pos, goal, PATH_BUDGET, extra, self.move_costs if kind == "safe" else None)
-            self.path_goal, self.path_t, self.path_kind = list(goal), t, kind
+                or (extra is not None) != self.path_safe):
+            self.path, self.path_goal, self.path_t = self.world.path(pos, goal, PATH_BUDGET, extra), list(goal), t
+            self.path_safe = extra is not None
         while len(self.path) > 1 and d2(pos, self.path[0]) < 4:
             self.path.pop(0)
         if not self.path:
@@ -825,13 +846,13 @@ class Bot:
         i = w._idx(p[0], p[1])
         return i >= 0 and p[2] - w.surf[i] > ROOF_Z
 
-    def loot_goal(self, me, pos, c, r, most=1, avoid=()):
-        """The nearest wanted loot on the ground (roof loot is roof_target's) that at most `most` mechs on the map guard
-        and no strong mech (`avoid`) is near; an item in the open counts LOOT_EXPO m farther per direction it can be
-        seen from."""
-        return min((p for p in self.loot_items(me) if d2(p, c) < r - 6 and d2(p, pos) < LOOT_RANGE and not self.on_roof(p)
+    def loot_goal(self, me, pos, c, r, most=1, avoid=(), around=None):
+        """The nearest wanted loot on the ground (roof loot is roof_target's) within LOOT_RANGE of us (or within
+        around = (centre, radius)) that at most `most` mechs on the map guard and no strong mech (`avoid`) is near."""
+        a, ar = around or (pos, LOOT_RANGE)
+        return min((p for p in self.loot_items(me) if d2(p, c) < r - 6 and d2(p, a) < ar and not self.on_roof(p)
                     and self.crowd(p, self.t) <= most and not any(d2(q, p) < CROWD_R for q in avoid)),
-                   key=lambda p: d2(p, pos) + LOOT_EXPO * (self.expo_at(p) or 0), default=None)
+                   key=lambda p: d2(p, pos), default=None)
 
     def roof_target(self, me, pos, c, r):
         """The nearest wanted loot up on a roof we have the energy to jet onto, or None."""
@@ -941,16 +962,28 @@ class Bot:
             under_fire = bool(T and T["kind"] == "mech" and T["los"] and t - self.hit_by.get(T["id"], -1e9) < 3)
             near = [g["pos"] for g in self.ghosts.values() if d2(g["pos"], pos) < EVADE_R]  # seen or heard close by
             out = not self.hiding and (healthy or not near)  # hurt, we go for things only while the map is clear around us
-            loot = self.loot_goal(me, pos, c, r, most, strong) if out else None
-            early = self.early_laser(me, pos, enemies, most, strong) if t < EARLY_S and not shot_at and out else None
+            opening = t < OPENING_S and not self.hiding and self.world is not None and self.world.expo is not None
+            around = None
+            if opening:  # settle on the safe spot near the spawn first, then loot around it
+                if self.anchor is None or d2(self.anchor, c) >= max(r - EDGE_MARGIN, 0.0):
+                    z = obs["zone"]
+                    self.anchor, self.anchored = self.anchor_spot(pos, c, r, z.get("next_center", c), z.get("next_radius", r)), False
+                if self.anchor:
+                    self.anchored = self.anchored or d2(self.anchor, pos) < 6
+                    around = (self.anchor, AROUND_R) if self.anchored else (pos, 30.0)  # getting there: only what's on the way
+            opening = opening and self.anchor is not None
+            loot = self.loot_goal(me, pos, c, r, most, strong, around) if out else None
+            early = self.early_laser(me, pos, enemies, most, strong, around) if t < EARLY_S and not shot_at and out else None
+            exposed = opening and engaged and (self.expo_at(pos) or 0) >= UNSAFE  # caught in the open: no trading shots here
+            cover = (self.safe_near(pos, COVER_R) or self.anchor) if exposed else None
             hide = self.hide_spot(pos, c, r, t) if self.hiding and not drop and not under_fire else None
             # keep away from strong mechs near us; hurt, from any mech near us
             threats = [q for q in strong if d2(q, pos) < AVOID_R] + ([] if healthy else near)
             evade = (self.evade_spot(pos, c, r, threats, t) if threats and not self.hiding and not under_fire
                      and not drop else None)
-            chase = self.chase_goal(pos, c, r, t, mine, strong) if healthy and not evade else None
-            calm = healthy and not shot_at and not engaged and self.crowd(pos, t, ROOF_CALM) == 0
-            hunt = self.hunt_goal(pos, c, r, t, mine) if healthy and not (drop or early or loot or chase) else None
+            chase = self.chase_goal(pos, c, r, t, mine, strong) if healthy and not evade and not opening else None
+            calm = healthy and not opening and not shot_at and not engaged and self.crowd(pos, t, ROOF_CALM) == 0
+            hunt = self.hunt_goal(pos, c, r, t, mine) if healthy and not opening and not (drop or early or loot or chase) else None
             if self.climb and (t - self.climb["t0"] > ROOF_TIMEOUT or (me["grounded"] and not calm and not self.on_roof(pos))):
                 self.climb = None  # trouble while still on the ground: forget the roof
             if not self.climb and calm and not (drop or hide or early or loot):
@@ -963,6 +996,8 @@ class Bot:
                 goal, mode, arrive = hide, "hide", 1.5
             elif evade:
                 goal, mode, arrive = evade, "evade" if not healthy else "avoid", 3.0
+            elif cover:
+                goal, mode, arrive = cover, "cover", 2.0  # opening, caught in the open: make for safe ground
             elif chase:
                 goal, mode, arrive = chase, "chase", 5.0  # a weak mech on its own: run it down
             elif early:
@@ -973,6 +1008,8 @@ class Bot:
                 goal, mode, arrive = self.climb["p"], "roof", 1.0
             elif engaged and (healthy or under_fire):
                 goal, mode = list(pos[:2]), "fight"  # stand and trade, strafing (running off loses fights)
+            elif opening:
+                goal, mode, arrive = self.anchor, "hold" if self.anchored else "settle", 3.0  # back to our safe spot
             elif healthy and hunt:
                 goal, mode, arrive = hunt, "hunt", 30.0  # a lone mech: go and take it on
             elif self.hiding or (near and not healthy):
@@ -1001,9 +1038,8 @@ class Bot:
                 move = unit(down[0] - x, down[1] - y)
         if move is None:
             move = self.steer(pos, goal, t, force=self.stuck_since is not None and t - self.stuck_since > 1,
-                              extra=self.safety_cost(t) if mode == "hide" and self.world else None,
-                              safe=mode not in ("zone", "dodge shell")) if gap > arrive else [0.0, 0.0]  # the zone won't wait
-            duel = engaged and mode in ("loot", "laser", "chase") and gap > 8  # trading shots on the way: zigzag there
+                              extra=self.safety_cost(t) if mode == "hide" and self.world else None) if gap > arrive else [0.0, 0.0]
+            duel = engaged and mode in ("loot", "laser", "chase", "cover", "settle") and gap > 8  # trading shots on the way: zigzag there
             if (mode in ("edge", "fight") or duel) and T and T["kind"] == "mech" and T["los"]:  # strafe across their line of fire
                 if t >= self.strafe_until:
                     self.strafe_sign, self.strafe_until = -self.strafe_sign, t + self.rng.uniform(0.35, 0.9)  # reverse before their led shot lands

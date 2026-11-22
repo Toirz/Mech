@@ -328,19 +328,11 @@ class World:
         n = int(math.dist(a[:2], b[:2]) / CELL) + 1
         return all(self.free(a[0] + (b[0] - a[0]) * k / n, a[1] + (b[1] - a[1]) * k / n) for k in range(n + 1))
 
-    def safe_costs(self, weight):
-        """Nav costs that also charge `weight` per step for a cell seen from all 24 directions (in proportion below
-        that), from the exposure map; None without one."""
-        if not self.expo:
-            return None
-        return array.array("f", (c + weight * e / 24 if e <= 24 else c for c, e in zip(self.cost, self.expo)))
-
-    def path(self, a, b, budget_s=0.01, extra=None, costs=None):
+    def path(self, a, b, budget_s=0.01, extra=None):
         """Waypoints [[x, y], ...] from a toward b. If the time budget runs out, the path to the
         explored cell closest to b (replanning later continues from there). [] = no progress.
-        `extra(cell)`, if given, is added to the cost of every step into that nav cell; `costs` replaces the
-        nav costs (safe_costs)."""
-        mnx, mny, cost = self.mnx, self.mny, costs or self.cost
+        `extra(cell)`, if given, is added to the cost of every step into that nav cell."""
+        mnx, mny, cost = self.mnx, self.mny, self.cost
         s, g = self.nav_cell(a[0], a[1]), self.nav_cell(b[0], b[1])
         if s == g:
             return [[b[0], b[1]]]
