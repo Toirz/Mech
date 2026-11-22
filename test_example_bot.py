@@ -96,6 +96,28 @@ if os.path.isdir(arena):
     assert spot and w.free(*spot) and math.dist(spot, e) >= 30 and not seen_by(e, spot), spot
     cost = hb.safety_cost(0.0)
     assert cost(w.nav_cell(*e)) > cost(w.nav_cell(*spot)) and w.path(p, spot, 0.05, cost)
+    # Safe ground: walking costs more through exposed cells, so paths cross fewer of them; roam waypoints are never red.
+    from example_bot import RED, MOVE_SAFE_W
+    mc = w.safe_costs(MOVE_SAFE_W)
+    assert len(mc) == len(w.cost) and max(mc[i] - w.cost[i] for i in range(len(mc))) == MOVE_SAFE_W
+    walk = [i for i in range(len(w.cost)) if w.cost[i] <= 1.0]
+    exposure = {}
+    for costs, kind in ((mc, "safe"), (None, "plain")):
+        prng, tot, length = random.Random(7), 0.0, 0.0
+        for _ in range(30):
+            a_, b_ = w.nav_center(prng.choice(walk)), w.nav_center(prng.choice(walk))
+            prev = a_
+            for q in w.path(a_, b_, 0.2, costs=costs):  # exposure along the way, per metre
+                tot += min(w.expo[w.nav_cell(*q)], 24) * math.dist(prev, q)
+                length += math.dist(prev, q)
+                prev = q
+        exposure[kind] = tot / length
+    assert exposure["safe"] < exposure["plain"], exposure
+    hb.rng, hb.visited, hb.move_costs = random.Random(4), {}, mc
+    for _ in range(10):
+        hb.roam, hb.roam_t = None, -1e9
+        g = hb.roam_goal([0, 0, 0], [0, 0], 400, 0.0)
+        assert g and w.expo[w.nav_cell(*g)] < RED, g
 # Roaming heads for cells we haven't been to, inside the safe circle; hiding without a map stays put.
 b = Bot.__new__(Bot)
 b.rng, b.world, b.visited, b.roam, b.roam_t = random.Random(2), None, {}, None, -1e9
