@@ -172,4 +172,10 @@ assert fb.weapons(me, muz, muz, T, fb.t)[1][1] is False
 T["m"]["hp"] = 1400
 assert fb.weapons(me, muz, muz, T, fb.t)[1][1] is True
 assert abs(fb.laser_need(LASER, dict(T, m={"hp": 200}), me) - 0.573) < 0.001 and fb.laser_need(LASER, None, me) == 0.75
+# In a fight the strafe drifts onto a cube 20 m off, not one 50 m off.
+fl = Bot.__new__(Bot)
+fl.pickups, fl.bad_pickups, fl.t, fl.cubes = {}, {}, 0.0, {5001: ([20, 0, 0], 0.0)}
+assert fl.fight_loot({"cubes": 0, "weapons": [GUN, None]}, [0, 0, 0]) == [20, 0, 0]
+fl.cubes = {5001: ([50, 0, 0], 0.0)}
+assert fl.fight_loot({"cubes": 0, "weapons": [GUN, None]}, [0, 0, 0]) is None
 print("ok")

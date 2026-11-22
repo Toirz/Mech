@@ -36,6 +36,7 @@ DROP_RANGE = 250.0   # m: farthest we go for a supply drop (3 cubes, full HP and
 ROAM_CELL = 40.0     # m: cells of the visited map; roaming heads for the one we left longest ago
 ROAM_REPICK = 25.0   # s: give up on a roam waypoint after this
 HIDE_HP, HEALED_HP = 0.25, 0.9  # HP fraction: hide below the first, go back out at the second
+FIGHT_LOOT = 35.0    # m: in a fight the strafe drifts onto a cube or wanted weapon this close (giddy, andrew-zhouu)
 FIGHT_RANGE = 150.0  # m: a seen mech this close (or one shooting us) stops the roam: stand and strafe
 ROOF_Z = 3.0         # m above the terrain: an item this high is on a roof (a jump clears 2.75 m)
 ROOF_MAX = 45.0      # m: highest roof we jet up to for loot (100 energy climbs about 60 m)
@@ -575,6 +576,11 @@ class Bot:
         out = [p for pid, (kind, p, _) in self.pickups.items() if self.bad_pickups.get(pid, -1) < self.t and self.wants(kind, me)[0]]
         return out + ([p for p, _ in self.cubes.values()] if me["cubes"] < CUBE_KEEP else [])
 
+    def fight_loot(self, me, pos):
+        """The nearest wanted weapon or cube within FIGHT_LOOT on our level: a cube is +4% HP (healed) and damage now."""
+        return min((p for p in self.loot_items(me) if d2(p, pos) < FIGHT_LOOT and abs(p[2] - pos[2]) < 4),
+                   key=lambda p: d2(p, pos), default=None)
+
     def on_roof(self, p):
         """Up on a building: above the walkable surface (ground or bridge deck; under a deck a jet only hits it)."""
         w = self.world
@@ -714,7 +720,7 @@ class Bot:
             elif self.climb:
                 goal, mode, arrive = self.climb["p"], "roof", 1.0
             elif engaged:
-                goal, mode = list(pos[:2]), "fight"  # stand and trade, strafing (running off loses fights)
+                goal, mode = self.fight_loot(me, pos) or list(pos[:2]), "fight"  # stand and trade, strafing onto any loot close by
             elif farm:
                 goal, mode, arrive = farm, "farm", 6.0  # cubes for the upgrades: shoot it, then pick them up as loot
             else:
