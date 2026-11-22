@@ -65,7 +65,7 @@ if os.path.isdir(arena):
     ls = rb.launch_spot(item)
     assert ls and w.free(*ls) and math.dist(ls, item[:2]) < 32, ls
     # Hiding: the shipped safety map loads for this map only; corners are where walls meet. With a mech 60 m off,
-    # the bot picks a spot within 60 m that it can't see, and the way there costs more near that mech.
+    # the bot picks a spot within 60 m with a wall between them, and the way there costs more near that mech.
     import json as _json
     import tempfile as _tmp
     from world import CORNER
@@ -83,7 +83,8 @@ if os.path.isdir(arena):
     cells = [i for i in range(len(w.expo)) if 8 <= w.expo[i] <= 20 and w.cost[i] <= 1.0]
 
     def seen_by(e, q):
-        return w.sees([e[0], e[1], w.ground_at(*e) + 8], [q[0], q[1], w.ground_at(*q) + 4.5])
+        eye, g = [e[0], e[1], w.ground_at(*e) + 8], w.ground_at(*q)
+        return w.clear(eye, [q[0], q[1], g + 4.5]) or w.clear(eye, [q[0], q[1], g + 9])  # a line of fire: trees don't stop it
     while True:  # a spot half in the open, a mech 60 m off, and somewhere within 60 m out of its sight
         p = w.nav_center(rng.choice(cells))
         a = rng.uniform(0, 2 * math.pi)

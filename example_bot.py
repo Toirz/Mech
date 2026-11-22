@@ -5,7 +5,8 @@ Priorities each decision (movement): dodge a shell > get back in the zone > capt
 > run down a weak mech (healthy) > a laser in the first minute > loot on the ground > loot on a roof (only when calm:
 from within FLY_RANGE, jet straight at it and drop onto it) > stand and strafe against a mech in a fight
 > go for a lone mech (healthy) > roam to the least recently visited cell.
-Everywhere, the safety map (how many of 24 directions each 4 m cell can be seen from) keeps us on safe ground: walks
+Everywhere, the safety map (from how many of 24 directions each 4 m cell has an open line of fire, 25-200 m out;
+trees don't stop shots) keeps us on safe ground: walks
 take paths that charge for exposed cells, roam waypoints and edge spots are never red (seen from RED+ directions)
 when there is another choice, and loot in the open counts as farther.
 
@@ -66,7 +67,7 @@ SWEEP, SWEEP_W = 1.2, 2.5  # rad either side of the way we face, and the sweep's
 GLANCE_EVERY = (5.0, 8.0)  # s between two looks behind
 GLANCE_S = 1.0       # s a look behind lasts (turning round takes 0.75 s at 4 rad/s)
 SILENT = 0.4         # move length that keeps us under step_speed (5 m/s): no step sounds
-RED = 19             # a cell seen from this many of 24 directions or more is red: no roaming to it, no edge spot on it
+RED = 19             # a cell open to fire from this many of 24 directions or more is red: no roaming to it, no edge spot on it
 MOVE_SAFE_W = 3.0    # extra A* cost per 4 m step, walking anywhere, through a cell seen from all 24 directions
                      # (paths 60-220 m: 14% -> 9% of the way on red cells, no longer; weighted A* needs > 2.5 to care)
 ROAM_EXPO = 4.0      # s of roam score per direction a roam waypoint can be seen from
@@ -353,7 +354,7 @@ class Bot:
                     continue
                 first = first or p
                 z = self.world.ground_at(p[0], p[1]) if self.world else pos[2]
-                if not any(self.sees(w, [p[0], p[1], z + mid]) for w in watchers):
+                if not any(self.los(w, [p[0], p[1], z + mid]) for w in watchers):  # a wall between: trees don't stop shots
                     self.evade, self.evade_t = p, t
                     return p
         self.evade, self.evade_t = first, t
@@ -707,11 +708,11 @@ class Bot:
         return best
 
     def hide_spot(self, pos, c, r, t):
-        """Where to hide: a walkable spot within HIDE_R, inside the safe circle, out of sight of the mechs we know of
-        (the 4 nearest on our map, seen, lost or heard, and a shooter we only felt, assumed 80 m out along the hit's
-        bearing), the best for: seen from few directions (the safety map), walls on two sides (a corner), far from
-        the mechs on our map, near us; if none of the best few is out of sight, the best of all anyway (less exposed,
-        farther off). Redone every HIDE_EVERY s; the old spot stays while it is still out of sight and not clearly
+        """Where to hide: a walkable spot within HIDE_R, inside the safe circle, with a wall or the terrain between it and
+        each of the mechs we know of (the 4 nearest on our map, seen, lost or heard, and a shooter we only felt, assumed
+        80 m out along the hit's bearing): trees don't do, shots go through them. Among those, the best for: open to
+        fire from few directions (the safety map), walls on two sides (a corner), far from the mechs on our map, near
+        us; if none of the best few is behind a wall from them all, the best of all anyway. Redone every HIDE_EVERY s; the old spot stays while it is still out of sight and not clearly
         worse. None if there is no walkable spot."""
         w = self.world
         rr = max(r - EDGE_MARGIN, 0.0)
@@ -726,9 +727,9 @@ class Bot:
             b = self.threat[0]
             watchers.append([pos[0] + 80 * math.cos(b), pos[1] + 80 * math.sin(b), pos[2] + eye])
 
-        def hidden(p):
-            q = [p[0], p[1], w.ground_at(p[0], p[1]) + mid]
-            return not any(self.sees(o, q) for o in watchers)
+        def hidden(p):  # behind a wall from all of them, at the body's middle and its top
+            g = w.ground_at(p[0], p[1])
+            return not any(self.los(o, [p[0], p[1], g + mid]) or self.los(o, [p[0], p[1], g + 2 * mid]) for o in watchers)
 
         def score(p):
             i = w.nav_cell(p[0], p[1])
