@@ -3,7 +3,7 @@ import math
 import os
 import random
 
-from example_bot import Bot, edge_spot, lead, mortar_aim, shell_landing, zone_at
+from example_bot import Bot, ang_diff, edge_spot, lead, mortar_aim, shell_landing, zone_at
 
 zone = {"center": [0, 0], "radius": 500, "next_center": [100, 0], "next_radius": 300, "shrink_start": 60, "shrink_end": 110}
 assert zone_at(zone, 0) == ([0, 0], 500)
@@ -68,6 +68,7 @@ if os.path.isdir(arena):
 b = Bot.__new__(Bot)
 b.rng, b.world, b.visited, b.roam, b.roam_t = random.Random(2), None, {}, None, -1e9
 b.threat, b.cover, b.cover_t, b.mech = None, None, -1e9, {"height": 9}
+b.ghosts = {}
 for x in range(-200, 1, 40):  # the west half is freshly visited
     for y in range(-200, 201, 40):
         b.visited[(x // 40, y // 40)] = 100.0
@@ -75,4 +76,16 @@ g = b.roam_goal([0, 0, 0], [0, 0], 250, 100.0)
 assert g and math.hypot(*g) < 233 and g[0] > 0, g
 assert b.roam_goal([1, 1, 0], [0, 0], 250, 101.0) == g  # keeps its waypoint until there
 assert b.cover_spot([5, 6, 0], [0, 0], 250, [{"pos": [50, 0, 0]}], 0.0) == [5, 6]
+# Ghosts: a mech that left our view stays where we lost it; it counts near items, and looking there with
+# nothing listed forgets it. With nothing to shoot we sweep either side of the way we face, and glance behind.
+g = Bot.__new__(Bot)
+g.cfg, g.mech, g.world, g.rng = {"vision": {"range": 200, "near_range": 45, "fov_deg": 120}}, {"height": 9, "eye_height": 8}, None, random.Random(0)
+g.ghosts = {1: {"pos": [100, 0, 0], "t": 5.0}, 2: {"pos": [-100, 0, 0], "t": 5.0}, 3: {"pos": [0, 30, 0], "t": 10.0}}
+assert g.crowd([90, 0], 10.0) == 1 and g.crowd([0, 0], 10.0, 20) == 0 and g.crowd([0, 0], 10.0, 31) == 1
+g.clear_ghosts(0.0, [0, 0, 0], 10.0)
+assert sorted(g.ghosts) == [2, 3]  # the one in front is gone; the one behind and the one listed now stay
+assert g.check_spot([0, 0, 0], [-90, 0], 10.0) == [-100, 0, 0]  # going its way: look there first
+g.glance_next, g.glance_until, g.glance_side = 3.0, -1.0, 1
+assert abs(math.pi - abs(ang_diff(g.look(0.0, 3.0), 0.0))) < 0.31  # a look behind...
+assert abs(g.look(0.0, 3.0 + 1.1)) <= 1.2 + 1e-9                    # ...then the sweep again
 print("ok")
