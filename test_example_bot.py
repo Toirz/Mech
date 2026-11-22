@@ -105,4 +105,64 @@ hs = pr.hist[3]
 f = pr.recall(3, hs[-1][0], hs[-1], 2.8, hs[-1][0] + 1e-6)
 assert f and f(0.4) == pr._recall(3, hs[-1][0], hs[-1], 2.8, hs[-1][0] + 1e-6)(0.4)
 assert min(pr.recalled[3]) >= hs[0][0]
+
+
+# Fights, on a made-up map: a 5 m wall along x = 50 and a wall too tall to see over along y = 10, flat ground.
+class Walls:
+    def clear(self, a, b):
+        for k, at, top in ((0, 50.0, 5.0), (1, 10.0, 1e9)):
+            if (a[k] - at) * (b[k] - at) < 0 and a[2] + (at - a[k]) / (b[k] - a[k]) * (b[2] - a[2]) < top:
+                return False
+        return True
+
+    def ground_at(self, x, y):
+        return 0.0
+
+
+def fight_bot():
+    fb = Bot.__new__(Bot)
+    fb.cfg = {"cubes": {"size_per_cube": 0.05, "damage_per_cube": 0.04, "stat_cap": 10}, "match": {"tick_hz": 20},
+              "projectile": {"gun_radius": 0.3}, "npc": {"radius": 1.8, "height": 3.5}, "crates": {"radius": 1.4, "height": 2.4}}
+    fb.mech = {"radius": 2.5, "height": 9, "eye_height": 8, "max_pitch": 1.3}
+    fb.world, fb.pred, fb.t = Walls(), Predictor(22.0), 10.0
+    fb.hit_by, fb.hit_on, fb.tid, fb.vhist, fb.short_until, fb.dbg = {}, {}, None, {}, 0.0, {}
+    return fb
+
+
+def mech(i, p, hp=1400, aim=0.0):
+    return {"id": i, "kind": "mech", "pos": p, "vel": [0, 0, 0], "aim": [aim, 0], "hp": hp, "max_hp": 1400, "cubes": 0}
+
+
+GUN = {"kind": "gun", "cooldown": 0, "ammo": 12, "reload": 0,
+       "stats": {"damage": 45, "cooldown": 0.24, "speed": 252, "range": 230, "spread_deg": 0.6, "mag": 12}}
+LASER = {"kind": "laser", "cooldown": 0, "charge": 0.75,
+         "stats": {"damage": 315, "charge": 0.75, "min_charge": 0.15, "min_frac": 0.35, "range": 280}}
+muz = [0, 0, 7]
+me = {"weapons": [GUN, dict(LASER)], "cubes": 0, "energy": 100, "aim": [0, 0], "stats": {"turn_rate": 4, "pitch_rate": 3}}
+fb = fight_bot()
+# Only its head and shoulders show over the 5 m wall: it is a target in the open, and a full charge on them is let go.
+T = fb.targets({"mechs": [mech(5, [60, 0, 0])], "crates": [], "beams": []}, me, muz, 1.0)
+assert T["los"] and not fb.los(muz, T["c"])
+me["aim"] = list(__import__("example_bot").aim_at(muz, fb.beam_point(muz, T)))
+assert fb.weapons(me, muz, muz, T, fb.t)[1] == [False, False]  # laser let go (the gun waits: its point is 1.8 m lower)
+# A 100 HP mech behind the tall wall 20 m off (its back to us) loses to the one in the open 100 m off that just shot us.
+fb.hit_by[7] = fb.t - 1
+obs = {"mechs": [mech(6, [0, 20, 0], hp=100, aim=math.pi / 2), mech(7, [-100, 0, 0])], "crates": [], "beams": []}
+assert fb.targets(obs, me, muz, 1.0)["id"] == 7
+# Hidden ones only: the best of them is still the target (the aim waits where it will show), not in the open.
+T = fb.targets(dict(obs, mechs=obs["mechs"][:1]), me, muz, 1.0)
+assert T["id"] == 6 and not T["los"]
+# Gun only: a mech in the open 180 m off, past where the gun opens a fight, loses to a hidden one 50 m off, until it joins in.
+gun_only = dict(me, weapons=[GUN, None])
+obs = {"mechs": [mech(6, [0, 50, 0]), mech(7, [-180, 0, 0])], "crates": [], "beams": []}
+fb.hit_by = {}
+assert fb.targets(obs, gun_only, muz, 1.0)["id"] == 6
+fb.hit_by[7] = fb.t - 1
+assert fb.targets(obs, gun_only, muz, 1.0)["id"] == 7
+# The one we are on is kept against a slightly better one; a clearly better one takes over.
+fb.tid, fb.hit_by = 7, {}
+obs = {"mechs": [mech(7, [-100, 0, 0]), mech(8, [-90, 5, 0])], "crates": [], "beams": []}
+assert fb.targets(obs, me, muz, 1.0)["id"] == 7
+obs["mechs"][1]["hp"] = 400
+assert fb.targets(obs, me, muz, 1.0)["id"] == 8
 print("ok")

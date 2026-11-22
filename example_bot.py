@@ -158,6 +158,7 @@ class Bot:
         self.crates, self.npcs = {}, {}  # id -> (pos, t seen): what we can farm for cubes
         self.bad_pickups = {}            # id -> t until we stop trying it
         self.hit_by, self.hit_on = {}, {}  # id -> last time it damaged us / we damaged it
+        self.tid = None                  # id of the target we shot at last decision (kept unless another is clearly better)
         self.dbg = {}
         self.visited, self.roam, self.roam_t = {}, None, -1e9  # cell -> last t there; current waypoint
         self.hiding, self.cover, self.cover_t = False, None, -1e9
@@ -245,27 +246,31 @@ class Bot:
             x["d"] = math.dist(muzzle, x["c"])
         busy = {b["by"] for b in obs["beams"]}
 
-        def score(x):
+        def can_hit(x):  # some part of it in the open, within the range one of our weapons fires at (as weapons() gates them)
+            joined = self.t - max(self.hit_by.get(x["id"], -1e9), self.hit_on.get(x["id"], -1e9)) < 5
+            return x["los"] and any(x["d"] <= (GUN_OPEN if w["kind"] == "gun" and not joined else w["stats"].get("range", 0))
+                                    for w in me["weapons"] if w and w["kind"] != "mortar")
+
+        def score(x):  # lower is better: near, few HP to burn through (shots to kill), shooting us, the one we're on
             m = x["m"]
             away = abs(ang_diff(m["aim"][0], math.atan2(muzzle[1] - x["pos"][1], muzzle[0] - x["pos"][0]))) > math.pi / 2
-            hp = m.get("hp", 1) / max(m.get("max_hp", 1), 1)
-            return (x["d"] / 100 + hp * 1.5 + (0 if x["los"] else 1.5) - 0.8 * away - 0.4 * (x["id"] in busy)
-                    - 1.0 * (self.t - self.hit_by.get(x["id"], -1e9) < 3))  # whoever is shooting us first
+            return (x["d"] / 100 + m.get("hp", 1400) / 1000 - 0.8 * away - 0.4 * (x["id"] in busy)
+                    - 1.0 * (self.t - self.hit_by.get(x["id"], -1e9) < 3) - 0.5 * (x["id"] == self.tid))
 
         mechs = sorted((x for x in mechs if x["d"] < 300), key=lambda x: x["d"])[:6]
-        for x in mechs:
-            x["los"] = self.los(muzzle, x["c"])
+        for x in mechs:  # "los": some part of it (middle, head and shoulders, legs) is in the open
+            x["los"] = self.beam_point(muzzle, x, 0.0) is not None
         npc = next((x for x in others if x["kind"] == "npc" and self.t - self.hit_by.get(x["id"], -1e9) < 3), None)
         if npc and not any(self.t - self.hit_by.get(x["id"], -1e9) < 3 for x in mechs):  # a drone is shooting us: answer it
-            npc["los"] = self.los(muzzle, npc["c"])
+            npc["los"] = self.beam_point(muzzle, npc, 0.0) is not None
             return npc
-        if mechs:
-            return min(mechs, key=score)
+        if mechs:  # one we can hit now beats the rest; else the best of them (the aim waits where it will show)
+            return min([x for x in mechs if can_hit(x)] or mechs, key=score)
         if hpf < 0.6:
             return None
         for x in sorted(others, key=lambda x: (x["kind"] != "npc", x["d"])):
             if x["d"] < (150 if x["kind"] == "npc" else 120) and (x["kind"] == "npc" or me["cubes"] < CUBE_KEEP or None in me["weapons"]):
-                x["los"] = self.los(muzzle, x["c"])
+                x["los"] = self.beam_point(muzzle, x, 0.0) is not None
                 if x["los"]:
                     return x
         return None
@@ -356,9 +361,8 @@ class Bot:
                     full = w["charge"] >= w["stats"]["charge"] - 0.05
                     on = aim_error(then, aims[i]) * dists[i] < T["r"] - LASER_MARGIN and off < T["r"] + 1.0
                     fire[i] = not (full and ok[i] and on)
-                else:  # start only if it will still be in the open when the charge is full
-                    fire[i] = (ok[i] and w["cooldown"] <= 0 and err < 0.35
-                               and self.los(muzzle, self.point_at(T, w["stats"]["charge"], T["c"][2] - T["pos"][2])))
+                else:  # start only if some of it will still be in the open when the charge is full
+                    fire[i] = ok[i] and w["cooldown"] <= 0 and err < 0.35 and self.beam_point(muzzle, T, w["stats"]["charge"]) is not None
             elif k == "lightning":
                 fire[i] = ok[i] and w["cooldown"] <= 0.1 and abs(ang_diff(now[0], aims[i][0])) < math.radians(w["stats"]["cone_deg"]) / 2 * 0.8
             elif k == "gun":  # on the lead point once the torso has slewed, and not wildly off now
@@ -411,13 +415,14 @@ class Bot:
                 return pt, p_pred * p_spread * (0.75 + 0.0625 * clear)
         return None, 0.0
 
-    def beam_point(self, muzzle, T):
-        """Where to point the laser: T's predicted body after the decision latency, at the middle, else
-        the highest or lowest part of it a beam can reach (a mech half behind a wall or a crest)."""
+    def beam_point(self, muzzle, T, tau=LATENCY):
+        """Where to point the laser: T's body predicted tau s ahead (where it is now for 0), at the middle, else
+        the highest or lowest part of it a beam can reach (a mech half behind a wall or a crest). None: all hidden."""
         mid = T["c"][2] - T["pos"][2]
         top = 2 * mid
+        p = self.pred.predict(T["id"], T["pos"], T["vel"], tau)[0] if tau else T["pos"]
         for z in (mid, top - 1.2, top - 2.5, 1.5):
-            pt = self.point_at(T, LATENCY, z)
+            pt = [p[0], p[1], p[2] + z]
             if self.los(muzzle, pt):
                 return pt
         return None
@@ -635,6 +640,7 @@ class Bot:
         enemies = [m for m in obs["mechs"] if m["kind"] == "mech"]
         near = min(enemies, key=lambda m: d2(m["pos"], pos), default=None)
         T = self.targets(obs, me, muzzle, hpf)  # no running off in the open: a laser hits a runner just the same
+        self.tid = T["id"] if T else None
         aim, fire, reload = self.weapons(me, muzzle, tube, T, t)
         if self.turn_to and t - self.turn_to[1] < 1.0 and not (T and T["kind"] == "mech" and T["los"] and T["id"] in self.hit_by
                                                               and t - self.hit_by[T["id"]] < 1.0):
