@@ -5,12 +5,6 @@ Priorities each decision (movement): dodge a shell > get back in the zone > capt
 > loot on a roof (only when calm: from within FLY_RANGE, jet straight at it and drop onto it) > stand and strafe against a mech in a fight
 > farm a drone or crate we saw (most cubes per metre; shot on the way, its cubes picked up as loot)
 > roam to the least recently visited cell (scanning).
-
-Where we look with nothing to shoot: whoever just hit us > a mech hunting us (one that aimed at us or hit us in the
-last HUNT_S: at it, at body height; roaming or farming, the scan swings round its way instead of the way we walk)
-> a mech sound just heard > the scan while roaming or farming > the way we walk > inward from the zone edge.
-Who our aim and guns serve: a hunter within NEAR_FIRST, seen or tracked behind cover (the laser pre-charged when it
-is about to show), before the best of the rest (targets(); that one still decides fighting and strafing).
 """
 import math
 import random
@@ -26,10 +20,6 @@ LOOT_RANGE = 200.0   # m: farthest we walk for a weapon or cube (roaming: we go 
 CUBE_KEEP = 15       # past this, cubes only make us bigger (stats cap at 10; 15 = one more upgrade)
 FARM_GUARD = 100.0   # m: a drone or crate this close to a mech we see isn't worth the walk
 FARM_S = 120.0       # s we remember a drone or crate we saw (crates stay put, drones keep near their home)
-HUNT_S = 15.0        # s a mech that aimed at us or hit us counts as hunting us (refreshed when we hear it again)
-HUNT_AIM = math.radians(15)    # its torso this close to the line to us: it is after us
-HEAR_MATCH = math.radians(20)  # a mech sound this close to a hunter's way (and of a fitting distance) is taken to be it
-HIT_GUESS = 100.0    # m out along the hit's bearing we put a shooter we can't see
 MORTAR_MIN = 20.0    # m: closer than this our own splash and knockback hurt us
 PATH_BUDGET = 0.01   # s of A* per decision (the whole decision must fit in 50 ms)
 MAP_MARGIN = 15.0    # m: goals stay this far inside the map edge (a wall); the first zone is bigger than the map
@@ -41,8 +31,6 @@ LATENCY = 0.03       # s from an observation to the shot leaving (the action app
 GUN_TOL = 1.0        # m: the gun fires only when its aim is this close to the lead point, at the target
 GUN_MIN_P = 0.15     # the gun holds fire below this estimated hit chance
 LASER_MARGIN = 0.8   # m: the beam must point this far inside the target's edge when we let go
-PRE_HOLD = 1.0       # s a full charge may wait for a hunter coming round cover (the server fires it itself after 2 s)
-NEAR_FIRST = 60.0    # m: a hunter this close gets our aim and guns before anyone farther, even behind cover
 DROP_RANGE = 250.0   # m: farthest we go for a supply drop (3 cubes, full HP and energy)
 ROAM_CELL = 40.0     # m: cells of the visited map; roaming heads for the one we left longest ago
 ROAM_REPICK = 25.0   # s: give up on a roam waypoint after this
@@ -161,7 +149,6 @@ class Bot:
         self.threat = None               # (bearing, t) of the last hit we took
         self.turn_to = None              # (bearing, t): hit in the back by someone we can't see: face that way a moment
         self.heard = None                # (bearing, t, dist) of the last mech sound
-        self.hunters = {}                # mech id -> [pos, t]: mechs after us, where we last knew them, last sign of them
         self.strafe_sign, self.strafe_until = 1, 0.0
         self.burn = True  # boosting in a fight: on until energy drops to 25, back on at 70
         self.vhist = {}  # target id -> [(t, its velocity)] over the last 2 s
@@ -198,24 +185,13 @@ class Bot:
         seen_k, seen_n = {k["id"] for k in obs["crates"]}, {m["id"] for m in npcs}
         self.crates = {k: v for k, v in self.crates.items() if (k in seen_k or d2(v[0], pos) > 25) and t - v[1] < FARM_S}
         self.npcs = {k: v for k, v in self.npcs.items() if (k in seen_n or d2(v[0], pos) > 40) and t - v[1] < FARM_S}
-        listed = {m["id"]: m for m in obs["mechs"] if m["kind"] == "mech"}  # in view, or tracked 5 s behind cover
-        for k, m in listed.items():  # hunting us: its torso on us
-            if abs(ang_diff(m["aim"][0], math.atan2(pos[1] - m["pos"][1], pos[0] - m["pos"][0]))) < HUNT_AIM:
-                self.hunters[k] = [list(m["pos"]), t]
-            elif k in self.hunters:
-                self.hunters[k][0] = list(m["pos"])
         for e in obs["events"]:
-            if e["type"] == "kill":
-                self.hunters.pop(e["target"], None)
-            elif e["type"] == "damaged" and e.get("bearing") is not None:
+            if e["type"] == "damaged" and e.get("bearing") is not None:
                 self.threat = (e["bearing"], t)
                 if e.get("rear"):
                     self.turn_to = (e["bearing"], t)
                 if e.get("by") is not None:
                     self.hit_by[e["by"]] = t
-                    if e["by"] < 100 and e["by"] not in listed:  # a mech (not a drone) we can't see: out along the hit
-                        b = e["bearing"]
-                        self.hunters[e["by"]] = [[pos[0] + HIT_GUESS * math.cos(b), pos[1] + HIT_GUESS * math.sin(b), pos[2]], t]
             elif e["type"] == "hit":
                 self.hit_on[e["target"]] = t
             elif e["type"] == "take_failed":
@@ -230,16 +206,6 @@ class Bot:
         if sounds:
             s = min(sounds, key=lambda s: (["near", "mid", "far"].index(s["dist"]), s["age"]))
             self.heard = (s["bearing"], t - s["age"], s["dist"])
-        S = self.cfg["sound"] if self.hunters else None
-        for s in sounds if S else ():  # a hunter out of the list that we hear from its way: still there, turned to it
-            lo, hi = {"near": (0.0, S["near"]), "mid": (S["near"], S["mid"])}.get(s["dist"], (S["mid"], 1e9))
-            for k, h in self.hunters.items():
-                d = d2(h[0], pos)
-                if k not in listed and lo - 40 < d < hi + 40 \
-                        and abs(ang_diff(s["bearing"], math.atan2(h[0][1] - pos[1], h[0][0] - pos[0]))) < HEAR_MATCH:
-                    h[0] = [pos[0] + d * math.cos(s["bearing"]), pos[1] + d * math.sin(s["bearing"]), h[0][2]]
-                    h[1] = max(h[1], t - s["age"])
-        self.hunters = {k: h for k, h in self.hunters.items() if t - h[1] < HUNT_S}
 
     def los(self, a, b):
         return self.world.clear(a, b) if self.world else True
@@ -289,8 +255,6 @@ class Bot:
         mechs = sorted((x for x in mechs if x["d"] < 300), key=lambda x: x["d"])[:6]
         for x in mechs:
             x["los"] = self.los(muzzle, x["c"])
-        # the closest hunter within NEAR_FIRST (in view or tracked behind cover): our weapons serve it first (act)
-        self.near = next((x for x in mechs if x["d"] <= NEAR_FIRST and x["id"] in self.hunters), None)
         npc = next((x for x in others if x["kind"] == "npc" and self.t - self.hit_by.get(x["id"], -1e9) < 3), None)
         if npc and not any(self.t - self.hit_by.get(x["id"], -1e9) < 3 for x in mechs):  # a drone is shooting us: answer it
             npc["los"] = self.los(muzzle, npc["c"])
@@ -392,10 +356,9 @@ class Bot:
                     full = w["charge"] >= w["stats"]["charge"] - 0.05
                     on = aim_error(then, aims[i]) * dists[i] < T["r"] - LASER_MARGIN and off < T["r"] + 1.0
                     fire[i] = not (full and ok[i] and on)
-                else:  # start only if it will still be in the open when the charge is full, or it's about to show
+                else:  # start only if it will still be in the open when the charge is full
                     fire[i] = (ok[i] and w["cooldown"] <= 0 and err < 0.35
-                               and self.los(muzzle, self.point_at(T, w["stats"]["charge"], T["c"][2] - T["pos"][2]))
-                               or self.precharge(muzzle, T, w, t, me["vel"]))
+                               and self.los(muzzle, self.point_at(T, w["stats"]["charge"], T["c"][2] - T["pos"][2])))
             elif k == "lightning":
                 fire[i] = ok[i] and w["cooldown"] <= 0.1 and abs(ang_diff(now[0], aims[i][0])) < math.radians(w["stats"]["cone_deg"]) / 2 * 0.8
             elif k == "gun":  # on the lead point once the torso has slewed, and not wildly off now
@@ -411,19 +374,6 @@ class Bot:
         calm = T is None or T["kind"] != "mech"
         reload = bool(gun) and not gun.get("reload") and (gun.get("ammo", 1) == 0 or (calm and gun.get("ammo", 0) < gun["stats"]["mag"] / 2))
         return aim, fire, reload
-
-    def precharge(self, muzzle, T, w, t, vel):
-        """Charge the laser early for a hunter the server still tracks behind cover when its predicted path and ours
-        (at the half speed charging leaves us) open a line of fire within charge + PRE_HOLD s: the beam is ready the
-        moment it shows, while its own laser still needs its 0.75 s. The hold-and-release logic fires it once it is
-        in the open and on target."""
-        st = w["stats"]
-        if not (T["kind"] == "mech" and not T["los"] and T["id"] in self.hunters and w["cooldown"] <= 0
-                and t >= self.short_until and T["d"] <= st["range"]):
-            return False
-        mid, half = T["c"][2] - T["pos"][2], self.mech.get("charge_move_mult", 0.5)
-        return any(self.los([muzzle[0] + vel[0] * half * tau, muzzle[1] + vel[1] * half * tau, muzzle[2]], self.point_at(T, tau, mid))
-                   for tau in (k * 0.15 for k in range(1, int((st["charge"] + PRE_HOLD) / 0.15) + 1)))
 
     def point_at(self, T, tau, hgt):
         """T's predicted position after tau s, hgt m above its feet."""
@@ -685,8 +635,7 @@ class Bot:
         enemies = [m for m in obs["mechs"] if m["kind"] == "mech"]
         near = min(enemies, key=lambda m: d2(m["pos"], pos), default=None)
         T = self.targets(obs, me, muzzle, hpf)  # no running off in the open: a laser hits a runner just the same
-        W = self.near or T  # what we aim and shoot at: a hunter close by first (pre-charged behind cover); T moves us
-        aim, fire, reload = self.weapons(me, muzzle, tube, W, t)
+        aim, fire, reload = self.weapons(me, muzzle, tube, T, t)
         if self.turn_to and t - self.turn_to[1] < 1.0 and not (T and T["kind"] == "mech" and T["los"] and T["id"] in self.hit_by
                                                               and t - self.hit_by[T["id"]] < 1.0):
             aim = [self.turn_to[0], 0.0]  # hit in the back (x1.5) by someone we don't have in front of us: turn round now
@@ -696,7 +645,7 @@ class Bot:
             self.hiding = True
         elif hpf >= HEALED_HP:
             self.hiding = False
-        if self.hiding and not (W and W["kind"] == "mech" and (t - self.hit_by.get(W["id"], -1e9) < 5 or W["d"] < 40)):
+        if self.hiding and not (T and T["kind"] == "mech" and (t - self.hit_by.get(T["id"], -1e9) < 5 or T["d"] < 40)):
             # regen needs 5 s without dealing damage too: shoot only whoever is on us; a charge is held
             fire = [bool(w and w["kind"] == "laser" and w.get("charge", 0) > 0) for w in me["weapons"]]
 
@@ -809,15 +758,10 @@ class Bot:
         # Where to look when there's nothing to shoot.
         if aim is None:
             inward = math.atan2(c[1] - y, c[0] - x)
-            hunter = min((h[0] for h in self.hunters.values()), key=lambda q: d2(q, pos), default=None)
             if t < 1.6:  # a full turn at spawn (turn_rate 4 rad/s): see the loot behind us too
                 aim = [me["aim"][0] + 1.0, 0.0]
             elif self.threat and t - self.threat[1] < 3:  # turn to face whoever hit us
                 aim = [self.threat[0], 0.0]
-            elif hunter and mode in ("roam", "farm") and wants_move:  # still scanning for loot, round the hunter's way
-                aim = [math.atan2(hunter[1] - y, hunter[0] - x) + math.sin(t * 2.0), 0.0]
-            elif hunter:  # crosshair where the closest mech after us is (tracked, or last seen or heard), at body height
-                aim = aim_at(muzzle, [hunter[0], hunter[1], hunter[2] + self.mech["height"] / 2])
             elif self.heard and t - self.heard[1] < 2:
                 aim = [self.heard[0], 0.0]
             elif mode in ("roam", "farm") and wants_move:  # scan: sweep +-1 rad across the way we walk

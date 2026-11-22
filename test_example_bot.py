@@ -77,7 +77,7 @@ assert b.roam_goal([1, 1, 0], [0, 0], 250, 101.0) == g  # keeps its waypoint unt
 assert b.cover_spot([5, 6, 0], [0, 0], 250, [{"pos": [50, 0, 0]}], 0.0) == [5, 6]
 # Farming: drones and crates we saw are remembered until we're close and they're gone; the trip worth most cubes per metre wins.
 b.cfg = {"npc": {"cubes": 2}, "crates": {"cubes": 1}}
-b.pickups, b.cubes, b.crates, b.npcs, b.hunters = {}, {}, {}, {}, {}
+b.pickups, b.cubes, b.crates, b.npcs = {}, {}, {}, {}
 seen = {"pickups": [], "cubes": [], "events": [], "sounds": [], "crates": [{"id": 1000, "pos": [60, 0, 0], "hp": 300}],
         "mechs": [{"id": 100, "kind": "npc", "pos": [-100, 0, 0]}]}
 b.remember(seen, 10.0, [0, 0, 0])
@@ -89,50 +89,6 @@ b.remember(dict(seen, crates=[], mechs=[]), 11.0, [55, 0, 0])  # at the crate an
 assert list(b.crates) == [] and list(b.npcs) == [100]
 b.remember(dict(seen, crates=[], mechs=[]), 200.0, [55, 0, 0])  # not seen for FARM_S: forgotten
 assert b.npcs == {}
-# Hunters: a mech with its torso on us is after us (one looking away isn't); a hit from one we can't see puts it out
-# along the hit (a drone's doesn't); heard from its way at a fitting distance it is still there; gone when killed or
-# HUNT_S after the last sign of it.
-b.cfg.update(sound={"near": 60, "mid": 160})
-b.hit_by, b.threat = {}, None
-quiet = dict(seen, crates=[], mechs=[])
-mech = lambda i, p, yaw: {"id": i, "kind": "mech", "pos": p, "aim": [yaw, 0.0]}
-b.remember(dict(quiet, mechs=[mech(5, [100, 0, 0], math.pi), mech(6, [0, 80, 0], 0.0)]), 40.0, [0, 0, 0])
-assert list(b.hunters) == [5]  # 5 aims west at us from the east; 6 aims east, away from us
-b.remember(dict(quiet, sounds=[{"kind": "gun", "bearing": 0.2, "dist": "mid", "age": 0.0}]), 45.0, [0, 0, 0])
-h = b.hunters[5]
-assert h[1] == 45.0 and abs(math.atan2(h[0][1], h[0][0]) - 0.2) < 1e-9 and abs(math.hypot(*h[0][:2]) - 100) < 1e-6
-b.remember(dict(quiet, sounds=[{"kind": "gun", "bearing": 2.0, "dist": "mid", "age": 0.0}]), 46.0, [0, 0, 0])
-assert b.hunters[5][1] == 45.0  # a sound from another way isn't it
-hit = {"type": "damaged", "amount": 45, "weapon": "gun", "bearing": math.pi / 2, "by": 9}
-b.remember(dict(quiet, events=[hit, dict(hit, by=104, weapon="npc")]), 47.0, [0, 0, 0])
-assert sorted(b.hunters) == [5, 9] and math.dist(b.hunters[9][0][:2], [0, 100]) < 1e-6
-b.remember(dict(quiet, events=[{"type": "kill", "target": 9}]), 48.0, [0, 0, 0])
-assert list(b.hunters) == [5]
-b.remember(quiet, 60.0, [0, 0, 0])  # HUNT_S after we last heard it
-assert b.hunters == {}
-# Pre-charge: the laser starts for a hunter the server tracks behind cover once its path brings it into the open soon
-# (no map here, so at once); not for a mech that isn't after us, one already in the open, on cooldown or shorted.
-from predict import Predictor
-b.pred, b.short_until, b.hunters = Predictor(22, None), 0.0, {5: [[100, 0, 0], 60.0]}
-T = {"id": 5, "kind": "mech", "los": False, "pos": [100, 0, 0], "c": [100, 0, 4.5], "vel": [0, 5, 0], "d": 100.0}
-laser = {"kind": "laser", "cooldown": 0.0, "charge": 0.0, "stats": {"charge": 0.75, "range": 280}}
-assert b.precharge([0, 0, 7], T, laser, 60.0, [0, 0, 0])
-assert not b.precharge([0, 0, 7], dict(T, id=6), laser, 60.0, [0, 0, 0])
-assert not b.precharge([0, 0, 7], dict(T, los=True), laser, 60.0, [0, 0, 0])
-assert not b.precharge([0, 0, 7], T, dict(laser, cooldown=1.0), 60.0, [0, 0, 0])
-b.short_until = 61.0
-assert not b.precharge([0, 0, 7], T, laser, 60.0, [0, 0, 0])
-# Near first: a hunter within NEAR_FIRST gets our guns though targets() would rather shoot a farther, hurt mech.
-b.cfg.update(cubes={"size_per_cube": 0.05})
-b.mech.update(radius=2.5)
-b.t, b.hit_by, b.hunters = 70.0, {}, {5: [[50, 0, 0], 70.0]}
-mk = lambda i, p, hp: {"id": i, "kind": "mech", "pos": p, "vel": [0, 0, 0], "aim": [0.0, 0.0], "hp": hp, "max_hp": 1400}
-o = {"mechs": [mk(5, [50, 0, 0], 1400), mk(6, [150, 0, 0], 300)], "crates": [], "beams": []}
-gun_only = {"cubes": 0, "weapons": [{"kind": "gun"}, None]}
-assert b.targets(o, gun_only, [0, 0, 7], 1.0)["id"] == 6 and b.near["id"] == 5
-b.hunters = {}
-b.targets(o, gun_only, [0, 0, 7], 1.0)
-assert b.near is None  # not after us: no say
 # Upgrades: the drum magazine comes before the other gun upgrades (and armor), plating and laser_damage before it.
 gun = {"weapons": [{"kind": "gun"}, None], "upgrades": []}
 assert b.pick_upgrade(["gun_rate", "armor", "gun_mag"], gun) == 2
