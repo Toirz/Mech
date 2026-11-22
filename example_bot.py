@@ -5,6 +5,8 @@ Priorities each decision (movement): dodge a shell > get back in the zone > capt
 > loot on a roof (only when calm: from within FLY_RANGE, jet straight at it and drop onto it) > stand and strafe against a mech in a fight
 > farm a drone or crate we saw (most cubes per metre; shot on the way, its cubes picked up as loot)
 > roam to the least recently visited cell (scanning).
+The first OPENING_S seconds loot where nobody is: every goal keeps FARM_GUARD from mechs in sight or heard lately,
+and only a mech within CLOSE (or shooting us) is fought.
 """
 import math
 import random
@@ -26,6 +28,9 @@ MAP_MARGIN = 15.0    # m: goals stay this far inside the map edge (a wall); the 
 MECH_SOUNDS = {"gun", "mortar", "laser", "laser_charge", "lightning", "step", "boost", "reload", "jet"}
 WEAPON_VALUE = {"laser": 1.0, "lightning": 0.7, "gun": 0.5}  # never a mortar: a laser hit on its carrier cooks off (+60%)
 EARLY_S, EARLY_RANGE = 60.0, 250.0  # the first minute: walk this far for a laser (else a lightning)
+OPENING_S = 20.0     # s: loot only FARM_GUARD away from mechs seen or heard; fight only one that comes CLOSE or shoots us
+CLOSE = 70.0         # m: a mech this close stops loot trips (and in the opening, it is fought)
+NOISE_S = 10.0       # s the opening keeps the spots it heard mechs at
 GUN_OPEN = 100.0     # m: the gun doesn't start a fight with a mech farther than this (it joins one at any range)
 LATENCY = 0.03       # s from an observation to the shot leaving (the action applies on the next ticks)
 GUN_TOL = 1.0        # m: the gun fires only when its aim is this close to the lead point, at the target
@@ -164,6 +169,7 @@ class Bot:
         self.visited, self.roam, self.roam_t = {}, None, -1e9  # cell -> last t there; current waypoint
         self.hiding, self.cover, self.cover_t = False, None, -1e9
         self.climb = None                # roof loot: {p: item, t0}
+        self.noises, self.avoid = {}, []  # opening: cell -> ([x, y], t) where mechs were heard; spots our goals keep FARM_GUARD from
         self.pred = Predictor(self.mech.get("gravity", 22), self.world.ground_at if self.world else None)
 
     # ----- memory -----
@@ -208,6 +214,15 @@ class Bot:
         if sounds:
             s = min(sounds, key=lambda s: (["near", "mid", "far"].index(s["dist"]), s["age"]))
             self.heard = (s["bearing"], t - s["age"], s["dist"])
+        if t < OPENING_S:  # where each came from, roughly: along its bearing, mid-way through its distance class
+            S = self.cfg["sound"]
+            for s in sounds:
+                reach = S["range"].get(s["kind"], S["mid"])  # "far" ends where that kind stops carrying
+                lo, hi = {"near": (0, S["near"]), "mid": (S["near"], S["mid"])}.get(s["dist"], (S["mid"], reach))
+                d = (min(lo, reach) + min(hi, reach)) / 2
+                q = [pos[0] + d * math.cos(s["bearing"]), pos[1] + d * math.sin(s["bearing"])]
+                self.noises[(round(q[0] / 20), round(q[1] / 20))] = (q, t - s["age"])  # one spot per 20 m cell: a short list
+            self.noises = {k: n for k, n in self.noises.items() if t - n[1] < NOISE_S}
 
     def los(self, a, b):
         return self.world.clear(a, b) if self.world else True
@@ -258,6 +273,8 @@ class Bot:
             return (x["d"] / 100 + m.get("hp", 1400) / 1000 - 0.8 * away - 0.4 * (x["id"] in busy)
                     - 1.0 * (self.t - self.hit_by.get(x["id"], -1e9) < 3) - 0.5 * (x["id"] == self.tid))
 
+        if self.t < OPENING_S:  # the opening loots where nobody is: fight only a mech that comes close or shoots us
+            mechs = [x for x in mechs if x["d"] < CLOSE or self.t - self.hit_by.get(x["id"], -1e9) < 5]
         mechs = sorted((x for x in mechs if x["d"] < 300), key=lambda x: x["d"])[:6]
         for x in mechs:  # "los": some part of it (middle, head and shoulders, legs) is in the open
             x["los"] = self.beam_point(muzzle, x, 0.0) is not None
@@ -461,7 +478,8 @@ class Bot:
             best = min(((d2(p, pos), p) for pid, (k, p, _) in self.pickups.items()
                         if k == kind and self.bad_pickups.get(pid, -1) < self.t and self.wants(k, me)[0]
                         and d2(p, pos) < EARLY_RANGE and abs(p[2] - pos[2]) < 4  # not on a roof
-                        and not any(d2(m["pos"], p) < d2(p, pos) for m in enemies)), default=None)  # nobody closer to it
+                        and not any(d2(m["pos"], p) < d2(p, pos) for m in enemies)  # nobody closer to it
+                        and not self.crowded(p)), default=None)
             if best:
                 return best[1]
         return None
@@ -502,7 +520,7 @@ class Bot:
         self.visited[(int(pos[0] // ROAM_CELL), int(pos[1] // ROAM_CELL))] = t
         rr = max(r - EDGE_MARGIN - 5, 0.0)
         g = self.roam
-        if g and d2(g, pos) > 8 and t - self.roam_t < ROAM_REPICK and d2(g, c) < rr:
+        if g and d2(g, pos) > 8 and t - self.roam_t < ROAM_REPICK and d2(g, c) < rr and not self.crowded(g):
             return g
         best, bs = None, None
         for _ in range(32):
@@ -512,7 +530,7 @@ class Bot:
                 p = self.world.clamp(p, MAP_MARGIN)
                 if not self.world.free(*p):
                     continue
-            if d2(p, c) >= rr or d2(p, pos) < 30:
+            if d2(p, c) >= rr or d2(p, pos) < 30 or self.crowded(p):
                 continue
             s = self.visited.get((int(p[0] // ROAM_CELL), int(p[1] // ROAM_CELL)), -300.0) + d2(p, pos) / 10  # 10 m ~ 1 s
             if bs is None or s < bs:
@@ -583,10 +601,14 @@ class Bot:
         i = w._idx(p[0], p[1])
         return i >= 0 and p[2] - w.surf[i] > ROOF_Z
 
+    def crowded(self, p):
+        """The opening: a mech in sight, or heard lately, is within FARM_GUARD of p (loot where nobody is)."""
+        return any(d2(q, p) < FARM_GUARD for q in self.avoid)
+
     def loot_goal(self, me, pos, c, r):
         """The nearest wanted loot on the ground (roof loot is roof_target's)."""
-        return min((p for p in self.loot_items(me) if d2(p, c) < r - 6 and d2(p, pos) < LOOT_RANGE and not self.on_roof(p)),
-                   key=lambda p: d2(p, pos), default=None)
+        return min((p for p in self.loot_items(me) if d2(p, c) < r - 6 and d2(p, pos) < LOOT_RANGE and not self.on_roof(p)
+                    and not self.crowded(p)), key=lambda p: d2(p, pos), default=None)
 
     def farm_goal(self, me, pos, c, r, enemies):
         """The remembered drone or crate on the ground worth the most cubes per metre within LOOT_RANGE, inside the circle,
@@ -596,12 +618,12 @@ class Bot:
         n, k = self.cfg["npc"].get("cubes", 2), self.cfg["crates"].get("cubes", 1)
         spots = [(p, n) for p, _ in self.npcs.values()] + [(p, k) for p, _ in self.crates.values()]
         return min(((d2(p, pos) / v, p) for p, v in spots if d2(p, c) < r - 6 and d2(p, pos) < LOOT_RANGE and not self.on_roof(p)
-                    and not any(d2(m["pos"], p) < FARM_GUARD for m in enemies)), key=lambda e: e[0], default=(0, None))[1]
+                    and not any(d2(m["pos"], p) < FARM_GUARD for m in enemies) and not self.crowded(p)), key=lambda e: e[0], default=(0, None))[1]
 
     def roof_target(self, me, pos, c, r):
         """The nearest wanted loot up on a roof we have the energy to jet onto, or None."""
         def ok(p):
-            return self.on_roof(p) and p[2] - pos[2] <= ROOF_MAX and d2(p, c) < r - 6 and d2(p, pos) < LOOT_RANGE
+            return self.on_roof(p) and p[2] - pos[2] <= ROOF_MAX and d2(p, c) < r - 6 and d2(p, pos) < LOOT_RANGE and not self.crowded(p)
         return min((p for p in self.loot_items(me) if ok(p)), key=lambda p: d2(p, pos), default=None)
 
     def launch_spot(self, p):
@@ -650,6 +672,7 @@ class Bot:
 
         # Who is dangerous, and should we run?
         enemies = [m for m in obs["mechs"] if m["kind"] == "mech"]
+        self.avoid = [m["pos"] for m in enemies] + [q for q, _ in self.noises.values()] if t < OPENING_S else []
         near = min(enemies, key=lambda m: d2(m["pos"], pos), default=None)
         T = self.targets(obs, me, muzzle, hpf)  # no running off in the open: a laser hits a runner just the same
         self.tid = T["id"] if T else None
@@ -686,11 +709,12 @@ class Bot:
                         and not any(d2(m["pos"], dr["pos"]) < 60 for m in enemies)):
                     drop = dr
                     break
-            loot = None if (near and d2(near["pos"], pos) < 70) or hpf < 0.35 else self.loot_goal(me, pos, c, r)
+            loot = None if (near and d2(near["pos"], pos) < CLOSE) or hpf < 0.35 else self.loot_goal(me, pos, c, r)
             shot_at = self.threat is not None and t - self.threat[1] < 3
             early = self.early_laser(me, pos, enemies) if t < EARLY_S and not shot_at else None
-            engaged = bool(T and T["kind"] == "mech" and T["los"]
-                           and (T["d"] < FIGHT_RANGE or t - self.hit_by.get(T["id"], -1e9) < 3))
+            opening = t < OPENING_S  # a far one shooting us is shot back on the way to where nobody is; only a close one is stood against
+            engaged = bool(T and T["kind"] == "mech" and T["los"] and (T["d"] < (CLOSE if opening else FIGHT_RANGE)
+                                                                     or (not opening and t - self.hit_by.get(T["id"], -1e9) < 3)))
             # shot by a mech we can see: stand and trade (running shows it our back, x1.5); hide once it lets up
             under_fire = bool(T and T["kind"] == "mech" and T["los"] and t - self.hit_by.get(T["id"], -1e9) < 3)
             hide = self.cover_spot(pos, c, r, enemies, t) if self.hiding and not drop and not under_fire else None

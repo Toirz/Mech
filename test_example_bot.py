@@ -68,6 +68,7 @@ if os.path.isdir(arena):
 b = Bot.__new__(Bot)
 b.rng, b.world, b.visited, b.roam, b.roam_t = random.Random(2), None, {}, None, -1e9
 b.threat, b.cover, b.cover_t, b.mech = None, None, -1e9, {"height": 9}
+b.avoid, b.noises = [], {}
 for x in range(-200, 1, 40):  # the west half is freshly visited
     for y in range(-200, 201, 40):
         b.visited[(x // 40, y // 40)] = 100.0
@@ -76,7 +77,7 @@ assert g and math.hypot(*g) < 233 and g[0] > 0, g
 assert b.roam_goal([1, 1, 0], [0, 0], 250, 101.0) == g  # keeps its waypoint until there
 assert b.cover_spot([5, 6, 0], [0, 0], 250, [{"pos": [50, 0, 0]}], 0.0) == [5, 6]
 # Farming: drones and crates we saw are remembered until we're close and they're gone; the trip worth most cubes per metre wins.
-b.cfg = {"npc": {"cubes": 2}, "crates": {"cubes": 1}}
+b.cfg = {"npc": {"cubes": 2}, "crates": {"cubes": 1}, "sound": {"near": 60, "mid": 160, "range": {"step": 40, "gun": 320}}}
 b.pickups, b.cubes, b.crates, b.npcs = {}, {}, {}, {}
 seen = {"pickups": [], "cubes": [], "events": [], "sounds": [], "crates": [{"id": 1000, "pos": [60, 0, 0], "hp": 300}],
         "mechs": [{"id": 100, "kind": "npc", "pos": [-100, 0, 0]}]}
@@ -89,6 +90,22 @@ b.remember(dict(seen, crates=[], mechs=[]), 11.0, [55, 0, 0])  # at the crate an
 assert list(b.crates) == [] and list(b.npcs) == [100]
 b.remember(dict(seen, crates=[], mechs=[]), 200.0, [55, 0, 0])  # not seen for FARM_S: forgotten
 assert b.npcs == {}
+# The opening: a gun heard "mid" puts a mech ~110 m out along its bearing, a step "near" ~20 m (it carries 40 m);
+# loot within FARM_GUARD of a spot heard (or a mech in sight) is skipped, and so are roam waypoints.
+b.remember(dict(seen, crates=[], mechs=[], sounds=[{"kind": "gun", "bearing": 0.0, "dist": "mid", "age": 0.0},
+                                                    {"kind": "step", "bearing": math.pi / 2, "dist": "near", "age": 0.0}]), 5.0, [0, 0, 0])
+assert [[round(v) for v in q] for q, _ in b.noises.values()] == [[110, 0], [0, 20]], b.noises
+b.remember(dict(seen, crates=[], mechs=[]), 16.0, [0, 0, 0])  # NOISE_S later: forgotten
+assert b.noises == {}
+b.noises = {(6, 0): ([110.0, 0.0], 12.0)}
+b.t, b.bad_pickups, b.cubes = 12.0, {}, {}
+b.pickups = {8001: ("laser", [90, 10, 0], 12.0), 8002: ("laser", [-150, 0, 0], 12.0)}
+hand = {"weapons": [{"kind": "gun"}, None], "cubes": 0}
+assert b.loot_goal(hand, [0, 0, 0], [0, 0], 250) == [90, 10, 0]  # nobody to keep away from: the nearer one
+b.avoid = [q for q, _ in b.noises.values()]
+assert b.loot_goal(hand, [0, 0, 0], [0, 0], 250) == [-150, 0, 0]
+assert math.dist(b.roam_goal([0, 0, 0], [0, 0], 250, 103.0), [110, 0]) >= 100
+b.avoid = []
 # Upgrades: the drum magazine comes before the other gun upgrades (and armor), plating and laser_damage before it.
 gun = {"weapons": [{"kind": "gun"}, None], "upgrades": []}
 assert b.pick_upgrade(["gun_rate", "armor", "gun_mag"], gun) == 2
@@ -124,7 +141,7 @@ def fight_bot():
     fb.cfg = {"cubes": {"size_per_cube": 0.05, "damage_per_cube": 0.04, "stat_cap": 10}, "match": {"tick_hz": 20},
               "projectile": {"gun_radius": 0.3}, "npc": {"radius": 1.8, "height": 3.5}, "crates": {"radius": 1.4, "height": 2.4}}
     fb.mech = {"radius": 2.5, "height": 9, "eye_height": 8, "max_pitch": 1.3}
-    fb.world, fb.pred, fb.t = Walls(), Predictor(22.0), 10.0
+    fb.world, fb.pred, fb.t = Walls(), Predictor(22.0), 30.0  # past the opening
     fb.hit_by, fb.hit_on, fb.tid, fb.vhist, fb.short_until, fb.dbg = {}, {}, None, {}, 0.0, {}
     return fb
 
@@ -172,4 +189,14 @@ assert fb.weapons(me, muz, muz, T, fb.t)[1][1] is False
 T["m"]["hp"] = 1400
 assert fb.weapons(me, muz, muz, T, fb.t)[1][1] is True
 assert abs(fb.laser_need(LASER, dict(T, m={"hp": 200}), me) - 0.573) < 0.001 and fb.laser_need(LASER, None, me) == 0.75
+# The opening: a mech in the open 100 m off is left alone and the crate gets shot; one within CLOSE, or one that
+# shoots us, is fought; after the opening any mech comes first again.
+fb.t, fb.hit_by, fb.tid = 10.0, {}, None
+obs = {"mechs": [mech(5, [100, 0, 0])], "crates": [{"id": 1000, "pos": [-30, 0, 0], "hp": 300}], "beams": []}
+assert fb.targets(obs, me, muz, 1.0)["id"] == 1000
+assert fb.targets(dict(obs, mechs=[mech(5, [60, 0, 0])]), me, muz, 1.0)["id"] == 5
+fb.hit_by[5] = fb.t - 1
+assert fb.targets(obs, me, muz, 1.0)["id"] == 5
+fb.t, fb.hit_by = 30.0, {}
+assert fb.targets(obs, me, muz, 1.0)["id"] == 5
 print("ok")
