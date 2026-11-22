@@ -77,7 +77,7 @@ assert b.roam_goal([1, 1, 0], [0, 0], 250, 101.0) == g  # keeps its waypoint unt
 assert b.cover_spot([5, 6, 0], [0, 0], 250, [{"pos": [50, 0, 0]}], 0.0) == [5, 6]
 # Farming: drones and crates we saw are remembered until we're close and they're gone; the trip worth most cubes per metre wins.
 b.cfg = {"npc": {"cubes": 2}, "crates": {"cubes": 1}}
-b.pickups, b.cubes, b.crates, b.npcs = {}, {}, {}, {}
+b.pickups, b.cubes, b.crates, b.npcs, b.dmg_in = {}, {}, {}, {}, []
 seen = {"pickups": [], "cubes": [], "events": [], "sounds": [], "crates": [{"id": 1000, "pos": [60, 0, 0], "hp": 300}],
         "mechs": [{"id": 100, "kind": "npc", "pos": [-100, 0, 0]}]}
 b.remember(seen, 10.0, [0, 0, 0])
@@ -172,4 +172,40 @@ assert fb.weapons(me, muz, muz, T, fb.t)[1][1] is False
 T["m"]["hp"] = 1400
 assert fb.weapons(me, muz, muz, T, fb.t)[1][1] is True
 assert abs(fb.laser_need(LASER, dict(T, m={"hp": 200}), me) - 0.573) < 0.001 and fb.laser_need(LASER, None, me) == 0.75
+
+# Whole decisions (no map: straight lines, everything in the open). Mech 5 stands 100 m east, facing us.
+CFG = {"mech": {"radius": 2.5, "height": 9, "eye_height": 8, "max_pitch": 1.3, "gravity": 22, "walk_speed": 11.7},
+       "weapons": {"mortar": {"gravity": 22, "splash_radius": 7}, "lightning": {"short_s": 2}}, "loot": {"pickup_radius": 4},
+       "cubes": {"size_per_cube": 0.05, "damage_per_cube": 0.04, "stat_cap": 10}, "npc": {"radius": 1.8, "height": 3.5, "cubes": 2},
+       "crates": {"radius": 1.4, "height": 2.4, "cubes": 1}, "projectile": {"gun_radius": 0.3}, "match": {"tick_hz": 20},
+       "drops": {"radius": 8}}
+
+
+def decide(hp, events, drops=(), cubes=()):
+    with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):  # "map not loaded"
+        bot = Bot({"config": CFG, "seed": 1, "map": {"dir": "/nonexistent"}})
+    o = {"tick": 200, "t": 100.0, "alive": 16, "mechs": [mech(5, [100, 0, 0], aim=math.pi)], "projectiles": [], "crates": [],
+         "cubes": list(cubes), "pickups": [], "sounds": [], "beams": [], "events": events, "drops": list(drops), "offer": None,
+         "zone": {"center": [0, 0], "radius": 500, "next_center": [0, 0], "next_radius": 400, "shrink_start": 200, "shrink_end": 250},
+         "self": {"id": 0, "pos": [0, 0, 0], "vel": [0, 0, 0], "aim": [0, 0], "hp": hp, "max_hp": 1400, "energy": 100, "grounded": True,
+                  "cubes": 0, "upgrades": [], "in_zone": True, "weapons": [dict(GUN), None],
+                  "stats": {"walk_speed": 11.7, "turn_rate": 4, "pitch_rate": 3, "muzzle_height": 7, "height": 9}}}
+    a = bot.act(o)
+    return __import__("mechfight").draw.take()["label"].split(" ")[0], a
+
+
+def hit(amount, weapon):
+    return {"type": "damaged", "amount": amount, "weapon": weapon, "bearing": 0.0, "by": 5}
+
+
+ring = {"id": 20000, "pos": [0, 0, 0], "radius": 8, "lands_in": 0, "capture_s": 4, "progress": 0, "holder": None}
+# On a landed drop at 280 HP: a laser hit (105 dps for the 4 s capture) means no capture: fight, strafing.
+mode, a = decide(280, [hit(315, "laser")], drops=[ring])
+assert mode != "drop" and math.hypot(*a["move"]) > 0.9, (mode, a)
+# A gun hit (15 dps) we outlive: capture, strafing inside the ring at walking speed (boosting would carry us out of it).
+mode, a = decide(280, [hit(45, "gun")], drops=[ring])
+assert mode == "drop" and math.hypot(*a["move"]) > 0.9 and not a["boost"], (mode, a)
+# A cube 30 m west while mech 5 shoots: weave there at 45 deg across its line, not straight at it.
+mode, a = decide(1400, [hit(45, "gun")], cubes=[{"id": 5001, "pos": [-30, 0, 0]}])
+assert mode == "loot" and a["move"][0] < -0.6 and abs(a["move"][1]) > 0.6, (mode, a)
 print("ok")

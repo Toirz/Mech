@@ -33,6 +33,7 @@ GUN_MIN_P = 0.15     # the gun holds fire below this estimated hit chance
 LASER_MARGIN = 0.8   # m: the beam must point this far inside the target's edge when we let go
 KILL_MARGIN = 0.75   # share of a beam's damage sure to land: 3 armor upgrades take 24%
 DROP_RANGE = 250.0   # m: farthest we go for a supply drop (3 cubes, full HP and energy)
+DROP_EARLY = 3.0     # s: set off for a drop so as to be there about this long before it lands (not 10 s in the open)
 ROAM_CELL = 40.0     # m: cells of the visited map; roaming heads for the one we left longest ago
 ROAM_REPICK = 25.0   # s: give up on a roam waypoint after this
 HIDE_HP, HEALED_HP = 0.25, 0.9  # HP fraction: hide below the first, go back out at the second
@@ -164,6 +165,8 @@ class Bot:
         self.visited, self.roam, self.roam_t = {}, None, -1e9  # cell -> last t there; current waypoint
         self.hiding, self.cover, self.cover_t = False, None, -1e9
         self.climb = None                # roof loot: {p: item, t0}
+        self.dmg_in = []                 # (t, amount) of weapon damage we took in the last 3 s
+        self.drop_id = None              # the supply drop we are going for
         self.pred = Predictor(self.mech.get("gravity", 22), self.world.ground_at if self.world else None)
 
     # ----- memory -----
@@ -187,9 +190,11 @@ class Bot:
         seen_k, seen_n = {k["id"] for k in obs["crates"]}, {m["id"] for m in npcs}
         self.crates = {k: v for k, v in self.crates.items() if (k in seen_k or d2(v[0], pos) > 25) and t - v[1] < FARM_S}
         self.npcs = {k: v for k, v in self.npcs.items() if (k in seen_n or d2(v[0], pos) > 40) and t - v[1] < FARM_S}
+        self.dmg_in = [d for d in self.dmg_in if t - d[0] < 3]
         for e in obs["events"]:
             if e["type"] == "damaged" and e.get("bearing") is not None:
                 self.threat = (e["bearing"], t)
+                self.dmg_in.append((t, e["amount"]))
                 if e.get("rear"):
                     self.turn_to = (e["bearing"], t)
                 if e.get("by") is not None:
@@ -672,25 +677,29 @@ class Bot:
         spot = self.free_edge_spot(pos, c, r)
         safe_r = max(r - EDGE_MARGIN, 0.0)
         arrive, mode, goal, move = ARRIVED, "edge", spot, None
+        engaged = bool(T and T["kind"] == "mech" and T["los"]
+                       and (T["d"] < FIGHT_RANGE or t - self.hit_by.get(T["id"], -1e9) < 3))
         dodge = self.dodge(obs, me, pos)
         if dodge:
             move, mode = dodge
         elif not me["in_zone"]:
             mode = "zone"
         else:
-            drop = None
+            drop, taking = None, sum(a for _, a in self.dmg_in) / 3  # dps we are taking
             for dr in obs.get("drops", []):
                 dd = d2(dr["pos"], pos)
+                walk = dd / st.get("walk_speed", 11.7)
+                left = max(walk, dr["lands_in"]) + dr.get("capture_s", 4) - (dr.get("progress", 0) if dr["holder"] == me["id"] else 0)
                 if (dr["holder"] in (None, me["id"]) and dd < DROP_RANGE and d2(dr["pos"], c) < r - 3
-                        and dr["lands_in"] <= dd / st.get("walk_speed", 11.7) + 10
+                        and (dr["lands_in"] <= walk + DROP_EARLY or dr["id"] == self.drop_id)
+                        and taking * left < me["hp"]  # we live to finish the capture, at the damage we take now
                         and not any(d2(m["pos"], dr["pos"]) < 60 for m in enemies)):
                     drop = dr
                     break
+            self.drop_id = drop and drop["id"]
             loot = None if (near and d2(near["pos"], pos) < 70) or hpf < 0.35 else self.loot_goal(me, pos, c, r)
             shot_at = self.threat is not None and t - self.threat[1] < 3
             early = self.early_laser(me, pos, enemies) if t < EARLY_S and not shot_at else None
-            engaged = bool(T and T["kind"] == "mech" and T["los"]
-                           and (T["d"] < FIGHT_RANGE or t - self.hit_by.get(T["id"], -1e9) < 3))
             # shot by a mech we can see: stand and trade (running shows it our back, x1.5); hide once it lets up
             under_fire = bool(T and T["kind"] == "mech" and T["los"] and t - self.hit_by.get(T["id"], -1e9) < 3)
             hide = self.cover_spot(pos, c, r, enemies, t) if self.hiding and not drop and not under_fire else None
@@ -741,13 +750,20 @@ class Bot:
                 move = unit(down[0] - x, down[1] - y)
         if move is None:
             move = self.steer(pos, goal, t, force=self.stuck_since is not None and t - self.stuck_since > 1) if gap > arrive else [0.0, 0.0]
-            if mode in ("edge", "fight") and T and T["kind"] == "mech" and T["los"]:  # strafe across their line of fire
+            # strafe across their line of fire: always at the edge or in a fight, and on errands while engaged
+            if T and T["kind"] == "mech" and T["los"] and (mode in ("edge", "fight") or engaged and mode in ("drop", "loot", "laser")):
                 if t >= self.strafe_until:
                     self.strafe_sign, self.strafe_until = -self.strafe_sign, t + self.rng.uniform(0.35, 0.9)  # reverse before their led shot lands
                 yaw = math.atan2(T["pos"][1] - y, T["pos"][0] - x) + self.strafe_sign * math.pi / 2
-                pull = min(gap / 6, 1.0)
-                to_spot = unit(goal[0] - x, goal[1] - y)
-                move = unit(math.cos(yaw) + to_spot[0] * pull, math.sin(yaw) + to_spot[1] * pull)
+                side = [math.cos(yaw), math.sin(yaw)]
+                if mode in ("edge", "fight") or gap <= arrive:  # holding a spot (or a drop's ring): pulled back to it
+                    pull = min(gap / (3 if mode == "drop" else 6), 1.0)  # a drop's ring is 8 m: leaving it restarts the capture
+                    to_spot = unit(goal[0] - x, goal[1] - y)
+                    move = unit(side[0] + to_spot[0] * pull, side[1] + to_spot[1] * pull)
+                else:  # on the way: weave along the path (stop-and-go where it runs across their line)
+                    v = [move[0] + side[0], move[1] + side[1]]
+                    n = math.hypot(*v)
+                    move = [v[0] / n, v[1] / n] if n > 1 else v
 
         # Stuck: commanded to move but not getting anywhere -> jump and jet; if that fails too, sidestep.
         # Not while fighting inside the zone (hopping about loses the fight); outside it the zone kills faster than they do.
@@ -771,7 +787,8 @@ class Bot:
             gap > 40 and me["energy"] > 60 and not T and mode != "roof")  # save the energy for the jet
         if fighting:  # boost through the whole fight, walking just long enough to recharge (duel-tested; jets lost)
             self.burn = me["energy"] > 70 if not self.burn else me["energy"] > 25
-            boost = boost or (self.burn and me["grounded"])
+            ring = mode == "drop" and gap < self.cfg.get("drops", {}).get("radius", 8) + 4  # walk there: boosting strafes out of it
+            boost = boost or (self.burn and me["grounded"] and not ring)
 
         # Where to look when there's nothing to shoot.
         if aim is None:
