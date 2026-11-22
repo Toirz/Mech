@@ -43,8 +43,9 @@ ROOF_TIMEOUT = 30.0  # s: give up a roof trip after this (walk up to 200 m, then
 FLY_RANGE = 40.0     # m: walk this close to roof loot, then jet straight at it and drop onto it
 DEBUG = bool(__import__("os").environ.get("BOT_DEBUG"))
 # Upgrade order, one entry per stack; with lightning in hand its two upgrades come right after laser_charge.
-UPGRADE_PLAN = ["plating", "laser_damage", "nanites", "plating", "laser_damage", "laser_charge", "plating", "armor",
-                "gun_damage", "gun_rate", "sensors", "armor", "gyros"]
+# gun_mag before the other gun ones: +8 rounds and -20% reload is +31% sustained gun dps (gun_damage +15%, gun_rate +8%).
+UPGRADE_PLAN = ["plating", "laser_damage", "gun_mag", "nanites", "plating", "laser_damage", "laser_charge", "plating", "armor",
+                "gun_mag", "gun_damage", "gun_rate", "sensors", "armor", "gyros"]
 UPGRADE_REST = ["armor", "nanites", "laser_charge", "laser_damage", "gun_damage", "gun_rate", "servos", "gyros", "sensors",
                 "gun_mag", "gun_velocity", "lightning_efficiency", "lightning_range", "lightning_chain", "capacitor",
                 "reactor", "jets", "laser_pierce"]

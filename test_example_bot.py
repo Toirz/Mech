@@ -89,4 +89,9 @@ b.remember(dict(seen, crates=[], mechs=[]), 11.0, [55, 0, 0])  # at the crate an
 assert list(b.crates) == [] and list(b.npcs) == [100]
 b.remember(dict(seen, crates=[], mechs=[]), 200.0, [55, 0, 0])  # not seen for FARM_S: forgotten
 assert b.npcs == {}
+# Upgrades: the drum magazine comes before the other gun upgrades (and armor), plating and laser_damage before it.
+gun = {"weapons": [{"kind": "gun"}, None], "upgrades": []}
+assert b.pick_upgrade(["gun_rate", "armor", "gun_mag"], gun) == 2
+assert b.pick_upgrade(["gun_mag", "plating", "servos"], gun) == 1
+assert b.pick_upgrade(["gun_damage", "gun_mag", "sensors"], dict(gun, upgrades=["gun_mag", "gun_mag"])) == 0  # gun_mag maxed
 print("ok")
