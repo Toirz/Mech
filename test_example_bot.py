@@ -94,6 +94,10 @@ gun = {"weapons": [{"kind": "gun"}, None], "upgrades": []}
 assert b.pick_upgrade(["gun_rate", "armor", "gun_mag"], gun) == 2
 assert b.pick_upgrade(["gun_mag", "plating", "servos"], gun) == 1
 assert b.pick_upgrade(["gun_damage", "gun_mag", "sensors"], dict(gun, upgrades=["gun_mag", "gun_mag"])) == 0  # gun_mag maxed
+# Mobility right after them: servos and jets beat nanites and the second plating, but not gun_mag.
+assert b.pick_upgrade(["nanites", "servos", "armor"], gun) == 1
+assert b.pick_upgrade(["plating", "jets", "sensors"], dict(gun, upgrades=["plating"])) == 1
+assert b.pick_upgrade(["servos", "gun_mag", "jets"], gun) == 1
 # Predictor: a strafer's remembered moves are worked out once per sample, the same as a fresh recall, and dropped with the sample.
 from predict import Predictor  # noqa: E402
 pr, tt, px, s = Predictor(22.0), 0.0, 0.0, 1
