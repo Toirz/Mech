@@ -3,17 +3,23 @@
 Priorities each decision (movement): dodge a shell > get back in the zone > a close fight (a mech we see within
 CLOSE_R: there is no running from it, so we stand, strafe and shoot until it is dead or gone, whatever our HP or
 mode) > capture a supply drop
-> hide out of sight (below HIDE_HP, until HEALED_HP: silently, along safe ground, into a safe wall corner) > get away from mechs too strong to fight where we stand (and, hurt, from any mech near us)
-> run down a weak mech (healthy) > a laser in the first minute > loot on the ground > loot on a roof (only when calm:
+> leave for another part of the map (a strong mech seen) > hide out of sight (below HIDE_HP, until HEALED_HP: silently,
+along safe ground, into a safe wall corner) > get away from any mech near us (hurt) > run down a weak mech (healthy)
+> a laser in the first minute > loot on the ground > loot on a roof (only when calm:
 from within FLY_RANGE, jet straight at it and drop onto it) > stand and strafe against a mech in a fight
 > go for a lone mech (healthy) > roam to the least recently visited cell.
 
 Strength = HP x cube damage bonus x firepower (best weapon + a third of the second), ours against each mech we see.
 Fight or run depends on where: standing on safe ground (open to fire from few directions on the safety map) we take
 on mechs up to FIGHT_SAFE x our strength, out in the open only up to FIGHT_OPEN x (more of them can shoot us there);
-stronger than that it is too strong: we keep AVOID_R away and never shoot first. Loot and drops likewise: one is
-skipped if a mech near it is too strong for the ground the item lies on (one we only heard counts as our equal).
-Below WEAK x ours (few cubes, little HP, only a gun) it is weak: healthy, we hunt it down while it is alone.
+stronger than that it is too strong: we never shoot it first. Loot and drops likewise: one is skipped if a mech near
+it is too strong for the ground the item lies on (one we only heard counts as our equal). Below WEAK x ours (few
+cubes, little HP, only a gun) it is weak.
+Marks: a strong mech we see is marked where it was, and the ground within DANGER_R of the mark stays dangerous for
+MARK_S (fading) even after it is out of sight: seeing one within FLEE_SEE we leave for another part of the map
+(180-340 m off, the least dangerous) and keep going there; roam waypoints, loot, hunts and every path keep out of
+dangerous ground. A weak mech is marked the other way round: healthy, we lock onto it and run it down (to its last
+spot when we lose it, for PREY_S), and roam leans towards where it was.
 
 The enemy map: every mech we see, and every mech sound we hear (bearing and near/mid/far give a rough spot), goes on
 it; a mech that leaves our view stays where we lost it (a ghost) until we look there and it is gone.
@@ -65,7 +71,15 @@ HUNT_RANGE = 200.0   # m: healthy with nothing to loot, we go for a lone mech on
 FIGHT_SAFE, FIGHT_OPEN = 1.5, 0.9  # the strongest mech (x ours) we fight on safe ground / out in the open (in between: by exposure)
 FIGHT_NOMAP = 1.4    # ...and without the safety map
 WEAK = 0.7           # a mech under this many times our strength is weak: healthy, we hunt it down
-AVOID_R = 150.0      # m we keep away from a strong mech (it reaches us with a laser well past that, but rarely sees us)
+MARK_S = 180.0       # s a strong or weak mech's mark lasts after we last saw it there (fading out)
+DANGER_R = 150.0     # m round a strong mech's mark that count as dangerous (fully at the mark, not at all this far)
+LURE_R = 150.0       # m round a weak mech's mark that draw us (roaming)
+FLEE_SEE = 200.0     # m: a strong mech seen this close sends us off to another part of the map
+FLEE_TO = (180.0, 260.0, 340.0)  # m from us where that other part is looked for
+FLEE_S = 45.0        # s at most on the way there before we look again
+PREY_S = 40.0        # s we go on after a weak mech we lost: to its last spot, and wait there
+ROAM_DANGER, ROAM_LURE = 400.0, 200.0  # roam score per unit of danger / lure at a waypoint (an unvisited cell is -300)
+DANGER_PATH_W = 4.0  # extra A* cost per 4 m step at the heart of a dangerous region
 SWEEP, SWEEP_W = 1.2, 2.5  # rad either side of the way we face, and the sweep's rate (peak slew 3 rad/s; the torso does 4)
 GLANCE_EVERY = (5.0, 8.0)  # s between two looks behind
 GLANCE_S = 1.0       # s a look behind lasts (turning round takes 0.75 s at 4 rad/s)
@@ -207,6 +221,9 @@ class Bot:
         self.visited, self.roam, self.roam_t = {}, None, -1e9  # cell -> last t there; current waypoint
         self.hiding, self.cover, self.cover_t = False, None, -1e9
         self.close = None                # (mech id, t it was last within CLOSE_KEEP): the close fight we're locked in
+        self.marks = {}                  # mech id -> {pos, t, kind: strong / weak}: where we last saw it
+        self.flee = None                 # {p, t0}: the other part of the map we are leaving for
+        self.prey = None                 # the weak mech's id we are running down
         self.ghosts = {}                 # the enemy map: mech id (seen) or ("h", n) (heard) -> {pos, t, r: how far off it may be}
         self.glance_next, self.glance_until, self.glance_side = 3.0, -1.0, 1
         self.heard_n = 0                 # keys of heard spots on the map: ("h", n)
@@ -234,6 +251,7 @@ class Bot:
         for e in obs["events"]:
             if e["type"] == "kill":
                 self.ghosts.pop(e["target"], None)
+                self.marks.pop(e["target"], None)
             if e["type"] == "damaged" and e.get("bearing") is not None:
                 self.threat = (e["bearing"], t)
                 if e.get("rear"):
@@ -275,9 +293,64 @@ class Bot:
         e = self.expo_at(p)
         return FIGHT_NOMAP if e is None else FIGHT_SAFE - (FIGHT_SAFE - FIGHT_OPEN) * e / 24
 
-    def strong_spots(self, t, mine, lim):
-        """Where the mechs too strong to fight (over lim x our strength) were in the last FACE_S."""
-        return [g["pos"] for g in self.ghosts.values() if g.get("s") and g["s"] > lim * mine and t - g["t"] <= FACE_S]
+    def mark(self, enemies, t, mine, lim):
+        """Mark the strong mechs (over lim x our strength) and the weak ones (under WEAK x) we see where they are; a mark
+        lasts MARK_S after we last saw it, and goes when we see that mech no longer so (or kill it)."""
+        for m in enemies:
+            s = (self.ghosts.get(m["id"]) or {}).get("s")
+            if not s:
+                continue
+            old = (self.marks.get(m["id"]) or {}).get("kind")
+            if s > lim * mine or (old == "strong" and s > mine):  # once strong, strong while still stronger than us
+                self.marks[m["id"]] = {"pos": list(m["pos"]), "t": t, "kind": "strong"}
+            elif s < WEAK * mine or (old == "weak" and s < 0.85 * mine):
+                self.marks[m["id"]] = {"pos": list(m["pos"]), "t": t, "kind": "weak"}
+            else:
+                self.marks.pop(m["id"], None)
+        self.marks = {k: v for k, v in self.marks.items() if t - v["t"] < MARK_S}
+
+    def field(self, p, t, kind="strong"):
+        """How dangerous (kind strong) or attractive (kind weak) the ground at p is from our marks: each adds up to 1 at
+        its mark, nothing DANGER_R / LURE_R off, fading over MARK_S."""
+        R = DANGER_R if kind == "strong" else LURE_R
+        return sum(max(0.0, 1 - d2(m["pos"], p) / R) * max(0.0, 1 - (t - m["t"]) / MARK_S)
+                   for m in self.marks.values() if m["kind"] == kind)
+
+    def flee_spot(self, pos, c, r, nc, nr, t):
+        """Another part of the map, away from the strong mechs we marked: FLEE_TO m off in 24 directions, walkable,
+        inside the safe circle; the least dangerous, then the farthest from them, preferring the next circle and less
+        exposed ground. None if there is none."""
+        rr, nrr = max(r - EDGE_MARGIN, 0.0), max(nr - EDGE_MARGIN, 0.0)
+        strong = [m["pos"] for m in self.marks.values() if m["kind"] == "strong"]
+        best, bs = None, None
+        for k in range(24):
+            a = 2 * math.pi * k / 24
+            for d in FLEE_TO:
+                p = [pos[0] + d * math.cos(a), pos[1] + d * math.sin(a)]
+                if self.world:
+                    p = self.world.clamp(p, MAP_MARGIN)
+                    if not self.world.free(*p):
+                        continue
+                if d2(p, c) >= rr:
+                    continue
+                far = min((d2(q, p) for q in strong), default=400.0)
+                sc = (100 * self.field(p, t) - min(far, 400.0) / 10 + (30 if d2(p, nc) >= nrr else 0)
+                      + (self.expo_at(p) if self.expo_at(p) is not None else 12) / 4)
+                if bs is None or sc < bs:
+                    best, bs = p, sc
+        return best
+
+    def danger_cost(self, t):
+        """Extra A* cost per step through dangerous ground (marks of strong mechs), or None without any."""
+        marks = [(m["pos"], max(0.0, 1 - (t - m["t"]) / MARK_S)) for m in self.marks.values() if m["kind"] == "strong"]
+        if not marks or not self.world:
+            return None
+        w, S = self.world, CELL * NAV
+
+        def extra(i):
+            x, y = w.x0 + (i % w.mnx + 0.5) * S, w.y0 + (i // w.mnx + 0.5) * S
+            return DANGER_PATH_W * sum(f * max(0.0, 1 - math.hypot(x - q[0], y - q[1]) / DANGER_R) for q, f in marks)
+        return extra
 
     def guarded(self, p, t, mine):
         """Is a mech we wouldn't fight on p's ground (over fight_limit(p) x our strength; one only heard counts as our
@@ -285,15 +358,6 @@ class Bot:
         lim = self.fight_limit(p) * mine
         return any((g.get("s") or mine) > lim and d2(g["pos"], p) < CROWD_R + min(g["r"], 40.0) + min(6.0 * (t - g["t"]), 60.0)
                    for g in self.ghosts.values())
-
-    def chase_goal(self, pos, c, r, t, mine, strong):
-        """The nearest mech we judged weak (under WEAK x our strength), seen in the last FACE_S within HUNT_RANGE and
-        inside the safe circle, alone (no other mech within CROWD_R of it, strong or not)."""
-        rr = max(r - EDGE_MARGIN, 0.0)
-        return min((g["pos"] for g in self.ghosts.values() if g.get("s") is not None and g["s"] < WEAK * mine
-                    and t - g["t"] <= FACE_S and d2(g["pos"], pos) < HUNT_RANGE and d2(g["pos"], c) < rr
-                    and self.crowd(g["pos"], t) <= 1 and not any(d2(q, g["pos"]) < CROWD_R for q in strong)),
-                   key=lambda q: d2(q, pos), default=None)
 
     def hear(self, s, pos, t):
         """Put a mech sound on the enemy map: along its bearing, at the middle of its distance class (capped by
@@ -379,7 +443,7 @@ class Bot:
         rr = max(r - EDGE_MARGIN, 0.0)
         spots = [g["pos"] for g in self.ghosts.values() if g["r"] <= 80 and d2(g["pos"], pos) < HUNT_RANGE and d2(g["pos"], c) < rr
                  and not (mine and g.get("s") and g["s"] > lim * mine)]
-        return min((q for q in spots if self.crowd(q, t) <= 1), key=lambda q: d2(q, pos), default=None)
+        return min((q for q in spots if self.crowd(q, t) <= 1 and self.field(q, t) < 0.3), key=lambda q: d2(q, pos), default=None)
 
     def check_spot(self, pos, goal, t):
         """The last spot of a lost mech near where we are going (or near us) that we could see if we looked, or None."""
@@ -644,7 +708,8 @@ class Bot:
                         if k == kind and self.bad_pickups.get(pid, -1) < self.t and self.wants(k, me)[0]
                         and d2(p, pos) < EARLY_RANGE and abs(p[2] - pos[2]) < 4  # not on a roof
                         and not any(d2(m["pos"], p) < d2(p, pos) for m in enemies)  # nobody closer to it
-                        and self.crowd(p, self.t) <= most and not (mine and self.guarded(p, self.t, mine))), default=None)
+                        and self.crowd(p, self.t) <= most and not (mine and self.guarded(p, self.t, mine))
+                        and self.field(p, self.t) < 0.3), default=None)
             if best:
                 return best[1]
         return None
@@ -685,7 +750,7 @@ class Bot:
         self.visited[(int(pos[0] // ROAM_CELL), int(pos[1] // ROAM_CELL))] = t
         rr = max(r - EDGE_MARGIN - 5, 0.0)
         g = self.roam
-        if g and d2(g, pos) > 8 and t - self.roam_t < ROAM_REPICK and d2(g, c) < rr:
+        if g and d2(g, pos) > 8 and t - self.roam_t < ROAM_REPICK and d2(g, c) < rr and self.field(g, t) < 0.3:
             return g
         best, bs = None, None
         for _ in range(32):
@@ -697,7 +762,8 @@ class Bot:
                     continue
             if d2(p, c) >= rr or d2(p, pos) < 30:
                 continue
-            s = self.visited.get((int(p[0] // ROAM_CELL), int(p[1] // ROAM_CELL)), -300.0) + d2(p, pos) / 10  # 10 m ~ 1 s
+            s = (self.visited.get((int(p[0] // ROAM_CELL), int(p[1] // ROAM_CELL)), -300.0) + d2(p, pos) / 10  # 10 m ~ 1 s
+                 + ROAM_DANGER * self.field(p, t) - ROAM_LURE * self.field(p, t, "weak"))  # away from strong, towards weak
             if bs is None or s < bs:
                 best, bs = p, s
         self.roam, self.roam_t = best, t
@@ -845,8 +911,8 @@ class Bot:
         """The nearest wanted loot on the ground (roof loot is roof_target's) within LOOT_RANGE that at most `most` mechs
         on the map guard and none too strong for the ground it lies on (guarded: harder in the open)."""
         return min((p for p in self.loot_items(me) if d2(p, c) < r - 6 and d2(p, pos) < LOOT_RANGE and not self.on_roof(p)
-                    and self.crowd(p, self.t) <= most and not (mine and self.guarded(p, self.t, mine))),
-                   key=lambda p: d2(p, pos), default=None)
+                    and self.crowd(p, self.t) <= most and not (mine and self.guarded(p, self.t, mine))
+                    and self.field(p, self.t) < 0.3), key=lambda p: d2(p, pos), default=None)  # not on dangerous ground
 
     def roof_target(self, me, pos, c, r):
         """The nearest wanted loot up on a roof we have the energy to jet onto, or None."""
@@ -924,6 +990,7 @@ class Bot:
         lim = self.fight_limit(pos)  # the strongest mech worth a fight where we stand: higher on safe ground
         strong_T = bool(T and T["kind"] == "mech" and ((self.ghosts.get(T["id"]) or {}).get("s") or 0) > lim * mine)
         close = self.close_fight(T, enemies, pos, t)  # a mech this close: fight it out, whatever our HP or mode
+        self.mark(enemies, t, mine, lim)
         if (not healthy or strong_T) and not close and not (T and T["kind"] == "mech" and (t - self.hit_by.get(T["id"], -1e9) < 5 or T["d"] < 40)):
             # hurt (regen needs 5 s without dealing damage), or it's strong: we start no fight; shoot only whoever is on us; a charge is held
             fire = [bool(w and w["kind"] == "laser" and w.get("charge", 0) > 0) for w in me["weapons"]]
@@ -940,14 +1007,13 @@ class Bot:
         elif not me["in_zone"]:
             mode = "zone"
         else:
-            strong = self.strong_spots(t, mine, lim)  # mechs too strong to fight here: we keep away from them
             drop = None
             for dr in obs.get("drops", []):
                 dd = d2(dr["pos"], pos)
                 if (dr["holder"] in (None, me["id"]) and dd < DROP_RANGE and d2(dr["pos"], c) < r - 3
                         and dr["lands_in"] <= dd / st.get("walk_speed", 11.7) + 10
                         and self.crowd(dr["pos"], t, 60) <= (1 if healthy else 0)  # hurt: only an unguarded one
-                        and not self.guarded(dr["pos"], t, mine)):
+                        and not self.guarded(dr["pos"], t, mine) and self.field(dr["pos"], t) < 0.2):
                     drop = dr
                     break
             most = 1 if healthy else 0  # mechs we take on for an item
@@ -961,11 +1027,27 @@ class Bot:
             loot = self.loot_goal(me, pos, c, r, most, mine) if out else None
             early = self.early_laser(me, pos, enemies, most, mine) if t < EARLY_S and not shot_at and out else None
             hide = self.hide_spot(pos, c, r, t) if self.hiding and not drop and not under_fire and not close else None
-            # keep away from strong mechs near us; hurt, from any mech near us
-            threats = [q for q in strong if d2(q, pos) < AVOID_R] + ([] if healthy else near)
-            evade = (self.evade_spot(pos, c, r, threats, t) if threats and not self.hiding and not under_fire
-                     and not drop and not close else None)
-            chase = self.chase_goal(pos, c, r, t, mine, strong) if healthy and not evade else None
+            # a strong mech seen (or its ground under us): leave for another part of the map, and keep going there
+            z, rr0 = obs["zone"], max(r - EDGE_MARGIN, 0.0)
+            if self.flee and (t - self.flee["t0"] > FLEE_S or d2(self.flee["p"], pos) < 8 or d2(self.flee["p"], c) >= rr0):
+                self.flee = None
+            seen_strong = any(m["kind"] == "strong" and m["t"] >= t and d2(m["pos"], pos) < FLEE_SEE for m in self.marks.values())
+            if not self.flee and (seen_strong or self.field(pos, t) > 0.5):
+                p = self.flee_spot(pos, c, r, z.get("next_center", c), z.get("next_radius", r), t)
+                self.flee = {"p": p, "t0": t} if p else None
+            flee = self.flee["p"] if self.flee and not close else None
+            # hurt: keep away from any mech near us
+            evade = (self.evade_spot(pos, c, r, near, t) if near and not healthy and not self.hiding and not under_fire
+                     and not drop and not close and not flee else None)
+            # a weak mech: lock onto it and run it down; lost, go to its last spot and wait there a while
+            pm = self.marks.get(self.prey) if self.prey is not None else None
+            if pm is None or pm["kind"] != "weak" or not healthy or t - pm["t"] > PREY_S or self.field(pm["pos"], t) > 0.3:
+                self.prey = None
+            if self.prey is None and healthy and not flee:
+                cands = [(d2(m["pos"], pos), k) for k, m in self.marks.items() if m["kind"] == "weak" and m["t"] >= t
+                         and d2(m["pos"], pos) < HUNT_RANGE and self.crowd(m["pos"], t) <= 1 and self.field(m["pos"], t) < 0.3]
+                self.prey = min(cands)[1] if cands else None
+            chase = self.marks[self.prey]["pos"] if self.prey is not None and not flee else None
             calm = healthy and not close and not shot_at and not engaged and self.crowd(pos, t, ROOF_CALM) == 0
             hunt = self.hunt_goal(pos, c, r, t, mine, lim) if healthy and not (drop or early or loot or chase) else None
             if self.climb and (t - self.climb["t0"] > ROOF_TIMEOUT or (me["grounded"] and not calm and not self.on_roof(pos))):
@@ -978,10 +1060,12 @@ class Bot:
                 goal, mode = list(pos[:2]), "close"  # a fight to the end: stand, strafe, shoot; no mode switching
             elif drop:
                 goal, mode, arrive = drop["pos"], "drop", max(drop["radius"] - 3, 1.0)
+            elif flee:
+                goal, mode, arrive = flee, "flee", 6.0  # a strong mech about: off to another part of the map
             elif hide:
                 goal, mode, arrive = hide, "hide", 1.5
             elif evade:
-                goal, mode, arrive = evade, "evade" if not healthy else "avoid", 3.0
+                goal, mode, arrive = evade, "evade", 3.0
             elif chase:
                 goal, mode, arrive = chase, "chase", 5.0  # a weak mech on its own: run it down
             elif early:
@@ -1020,8 +1104,9 @@ class Bot:
                 move = unit(down[0] - x, down[1] - y)
         if move is None:
             move = self.steer(pos, goal, t, force=self.stuck_since is not None and t - self.stuck_since > 1,
-                              extra=self.safety_cost(t) if mode == "hide" and self.world else None) if gap > arrive else [0.0, 0.0]
-            duel = engaged and mode in ("loot", "laser", "chase") and gap > 8  # trading shots on the way: zigzag there
+                              extra=(self.safety_cost(t) if mode == "hide" else None if mode in ("zone", "dodge shell")
+                                     else self.danger_cost(t)) if self.world else None) if gap > arrive else [0.0, 0.0]
+            duel = engaged and mode in ("loot", "laser", "chase", "flee") and gap > 8  # trading shots on the way: zigzag there
             if (mode in ("edge", "fight", "close") or duel) and T and T["kind"] == "mech" and T["los"]:  # strafe across their line of fire
                 if t >= self.strafe_until:
                     self.strafe_sign, self.strafe_until = -self.strafe_sign, t + self.rng.uniform(0.35, 0.9)  # reverse before their led shot lands

@@ -79,6 +79,7 @@ if os.path.isdir(arena):
     assert sum(CORNER[m] == 2 for m in w.walls) > 100
     hb = Bot.__new__(Bot)
     hb.world, hb.mech, hb.threat, hb.cover, hb.cover_t, hb.hide_dbg = w, {"height": 9, "eye_height": 8}, None, None, -1e9, []
+    hb.marks = {}
     rng = random.Random(3)
     cells = [i for i in range(len(w.expo)) if 8 <= w.expo[i] <= 20 and w.cost[i] <= 1.0]
 
@@ -124,6 +125,7 @@ b = Bot.__new__(Bot)
 b.rng, b.world, b.visited, b.roam, b.roam_t = random.Random(2), None, {}, None, -1e9
 b.threat, b.cover, b.cover_t, b.mech = None, None, -1e9, {"height": 9}
 b.ghosts = {}
+b.marks = {}
 for x in range(-200, 1, 40):  # the west half is freshly visited
     for y in range(-200, 201, 40):
         b.visited[(x // 40, y // 40)] = 100.0
@@ -135,6 +137,7 @@ assert b.hide_spot([5, 6, 0], [0, 0], 250, 0.0) == [5, 6]  # no map: hide where 
 # nothing listed forgets it. With nothing to shoot we sweep either side of the way we face, and glance behind.
 g = Bot.__new__(Bot)
 g.cfg, g.mech, g.world, g.rng = {"vision": {"range": 200, "near_range": 45, "fov_deg": 120}}, {"height": 9, "eye_height": 8}, None, random.Random(0)
+g.marks = {}
 g.ghosts = {1: {"pos": [100, 0, 0], "t": 5.0, "r": 0.0}, 2: {"pos": [-100, 0, 0], "t": 5.0, "r": 0.0}, 3: {"pos": [0, 30, 0], "t": 10.0, "r": 0.0}}
 assert g.crowd([90, 0], 10.0) == 1 and g.crowd([0, 0], 10.0, 20) == 0 and g.crowd([0, 0], 10.0, 31) == 1
 g.clear_ghosts(0.0, [0, 0, 0], 10.0)
@@ -176,9 +179,18 @@ mine = g.strength(1400, 0, ["gun"])
 big, small = g.strength(1960, 10, ["gun", "laser"]), g.strength(420, 0, ["gun"])
 assert big > 1.4 * mine and small < 0.7 * mine and 0.7 * mine < g.strength(1400, 0, ["gun"]) < 1.4 * mine
 g.ghosts = {7: {"pos": [120, 0, 0], "t": 50.0, "r": 0.0, "s": big}, 8: {"pos": [-100, 0, 0], "t": 50.0, "r": 0.0, "s": small}}
-assert g.strong_spots(50.0, mine, 1.4) == [[120, 0, 0]]
-assert g.chase_goal([0, 0, 0], [0, 0], 500, 50.0, mine, g.strong_spots(50.0, mine, 1.4)) == [-100, 0, 0]
-g.ghosts[8]["pos"] = [100, 30, 0]  # the weak one next to the strong one: leave it
-assert g.chase_goal([0, 0, 0], [0, 0], 500, 50.0, mine, g.strong_spots(50.0, mine, 1.4)) is None
-assert g.hunt_goal([0, 0, 0], [0, 0], 500, 50.0, mine) is None  # nor do we hunt the strong one
+# Marks: the strong one turns the ground round it dangerous and the weak one's attractive, for minutes after; a flee
+# spot lies away from the strong one; a lone mech on dangerous ground isn't hunted.
+g.marks = {}
+g.mark([{"id": 7, "pos": [120, 0, 0]}, {"id": 8, "pos": [-100, 0, 0]}], 50.0, mine, 1.4)
+assert {k: m["kind"] for k, m in g.marks.items()} == {7: "strong", 8: "weak"}
+assert g.field([120, 0], 50.0) == 1.0 and g.field([300, 0], 50.0) == 0.0 and abs(g.field([120, 0], 140.0) - 0.5) < 1e-9
+assert g.field([-100, 0], 50.0, "weak") == 1.0
+g.mark([], 260.0, mine, 1.4)
+assert g.marks == {}  # 3 minutes on, unseen: forgotten
+g.mark([{"id": 7, "pos": [120, 0, 0]}], 50.0, mine, 1.4)
+fs = g.flee_spot([0, 0, 0], [0, 0], 1000, [0, 0], 1000, 50.0)
+assert fs and fs[0] < 0 and math.hypot(*fs) >= 180, fs
+g.ghosts[8]["pos"] = [100, 30, 0]  # the weak one next to the strong one: not worth the walk
+assert g.hunt_goal([0, 0, 0], [0, 0], 500, 50.0, mine) is None
 print("ok")
