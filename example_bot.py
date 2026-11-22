@@ -45,7 +45,9 @@ FLY_RANGE = 40.0     # m: walk this close to roof loot, then jet straight at it 
 DEBUG = bool(__import__("os").environ.get("BOT_DEBUG"))
 # Upgrade order, one entry per stack; with lightning in hand its two upgrades come right after laser_charge.
 # gun_mag before the other gun ones: +8 rounds and -20% reload is +31% sustained gun dps (gun_damage +15%, gun_rate +8%).
-UPGRADE_PLAN = ["plating", "laser_damage", "gun_mag", "nanites", "plating", "laser_damage", "laser_charge", "plating", "armor",
+# servos (+8% walk and boost speed) and jets (-25% boost drain: longer fight boosts) next: giddy's speed order scored
+# 5.73 against its 5.41 mean on the server; before this they ranked 11th and 15th of 16, so jets was never picked.
+UPGRADE_PLAN = ["plating", "laser_damage", "gun_mag", "servos", "jets", "nanites", "plating", "laser_damage", "laser_charge", "plating", "armor",
                 "gun_mag", "gun_damage", "gun_rate", "sensors", "armor", "gyros"]
 UPGRADE_REST = ["armor", "nanites", "laser_charge", "laser_damage", "gun_damage", "gun_rate", "servos", "gyros", "sensors",
                 "gun_mag", "gun_velocity", "lightning_efficiency", "lightning_range", "lightning_chain", "capacitor",

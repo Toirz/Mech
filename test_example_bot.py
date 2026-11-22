@@ -172,4 +172,8 @@ assert fb.weapons(me, muz, muz, T, fb.t)[1][1] is False
 T["m"]["hp"] = 1400
 assert fb.weapons(me, muz, muz, T, fb.t)[1][1] is True
 assert abs(fb.laser_need(LASER, dict(T, m={"hp": 200}), me) - 0.573) < 0.001 and fb.laser_need(LASER, None, me) == 0.75
+# Mobility right after them: servos and jets beat nanites and the second plating, but not gun_mag.
+assert b.pick_upgrade(["nanites", "servos", "armor"], gun) == 1
+assert b.pick_upgrade(["plating", "jets", "sensors"], dict(gun, upgrades=["plating"])) == 1
+assert b.pick_upgrade(["servos", "gun_mag", "jets"], gun) == 1
 print("ok")
