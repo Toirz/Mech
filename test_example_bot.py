@@ -94,4 +94,15 @@ gun = {"weapons": [{"kind": "gun"}, None], "upgrades": []}
 assert b.pick_upgrade(["gun_rate", "armor", "gun_mag"], gun) == 2
 assert b.pick_upgrade(["gun_mag", "plating", "servos"], gun) == 1
 assert b.pick_upgrade(["gun_damage", "gun_mag", "sensors"], dict(gun, upgrades=["gun_mag", "gun_mag"])) == 0  # gun_mag maxed
+# Predictor: a strafer's remembered moves are worked out once per sample, the same as a fresh recall, and dropped with the sample.
+from predict import Predictor  # noqa: E402
+pr, tt, px, s = Predictor(22.0), 0.0, 0.0, 1
+for k in range(120):
+    tt, s = tt + 0.1, -s if k % 7 == 0 else s
+    px += s * 1.17
+    pr.update(tt, 3, [px, 50, 0], [s * 11.7, 0, 0], 2.8, [0, 0, 0])
+hs = pr.hist[3]
+f = pr.recall(3, hs[-1][0], hs[-1], 2.8, hs[-1][0] + 1e-6)
+assert f and f(0.4) == pr._recall(3, hs[-1][0], hs[-1], 2.8, hs[-1][0] + 1e-6)(0.4)
+assert min(pr.recalled[3]) >= hs[0][0]
 print("ok")

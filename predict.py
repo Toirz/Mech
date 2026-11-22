@@ -23,6 +23,7 @@ A hit is scored on the error across our line of sight: along it, a bullet still 
 Vertical: airborne targets fall at gravity; grounded ones follow the ground under the predicted spot.
 """
 import math
+from bisect import bisect_left, bisect_right
 
 HORIZONS = (0.1, 0.3, 0.5, 0.7, 0.9)
 KEEP_S = 3.5          # s of history kept per target
@@ -88,7 +89,7 @@ class Predictor:
     def __init__(self, gravity=22.0, ground=None):
         self.g = gravity
         self.flips, self.run = {}, {}  # id -> reversal times; id -> (unit run direction, last time it ran)
-        self.radius, self.mem = {}, {}
+        self.radius, self.mem, self.recalled = {}, {}, {}  # recalled: id -> {sample time: recall()}
         self.ground = ground          # ground(x, y) -> z, or None
         self.hist = {}                # id -> [(t, pos, vel)]
         self.own = {}                 # (id, p, horizon) -> Score
@@ -105,6 +106,9 @@ class Predictor:
         h.append((t, list(pos), list(vel)))
         while h and t - h[0][0] > KEEP_S:
             h.pop(0)
+        c = self.recalled.get(mid)
+        for k in [k for k in c if k < h[0][0]] if c else ():  # samples no longer in the history
+            del c[k]
         sp = math.hypot(vel[0], vel[1])
         if sp >= FAST:  # a reversal: running the other way from its last run
             u = (vel[0] / sp, vel[1] / sp)
@@ -163,7 +167,14 @@ class Predictor:
 
     def recall(self, mid, t0, sample, radius, known_by):
         """tau -> displacement from `sample` (at time t0) by remembered moves, or None without enough of them.
-        Only moves filed by `known_by` count (honest hindsight scoring)."""
+        Only moves filed by `known_by` count (honest hindsight scoring). Worked out once per sample: the
+        prediction at t0 and the hindsight scores at each horizon after it all ask for the same one."""
+        c = self.recalled.setdefault(mid, {})
+        if t0 not in c:
+            c[t0] = self._recall(mid, t0, sample, radius, known_by)
+        return c[t0]
+
+    def _recall(self, mid, t0, sample, radius, known_by):
         _, _, v0 = sample
         sp = math.hypot(v0[0], v0[1])
         a = self.age(mid, t0)
@@ -180,9 +191,10 @@ class Predictor:
                     break
             if len(near) < 6:
                 continue
+            along = sorted(f[1] for f in near)  # count neighbours by bisection: O(n log n), not O(n^2)
             best, bn = None, -1
             for e in near:
-                n = sum(abs(f[1] - e[1]) < radius for f in near)
+                n = bisect_left(along, e[1] + radius) - bisect_right(along, e[1] - radius)
                 if n > bn:
                     best, bn = e, n
             xs = [f[1] for f in near if abs(f[1] - best[1]) < radius]
