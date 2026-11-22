@@ -77,7 +77,7 @@ assert b.roam_goal([1, 1, 0], [0, 0], 250, 101.0) == g  # keeps its waypoint unt
 assert b.cover_spot([5, 6, 0], [0, 0], 250, [{"pos": [50, 0, 0]}], 0.0) == [5, 6]
 # Farming: drones and crates we saw are remembered until we're close and they're gone; the trip worth most cubes per metre wins.
 b.cfg = {"npc": {"cubes": 2}, "crates": {"cubes": 1}}
-b.pickups, b.cubes, b.crates, b.npcs = {}, {}, {}, {}
+b.pickups, b.cubes, b.crates, b.npcs, b.seen = {}, {}, {}, {}, {}
 seen = {"pickups": [], "cubes": [], "events": [], "sounds": [], "crates": [{"id": 1000, "pos": [60, 0, 0], "hp": 300}],
         "mechs": [{"id": 100, "kind": "npc", "pos": [-100, 0, 0]}]}
 b.remember(seen, 10.0, [0, 0, 0])
@@ -172,4 +172,10 @@ assert fb.weapons(me, muz, muz, T, fb.t)[1][1] is False
 T["m"]["hp"] = 1400
 assert fb.weapons(me, muz, muz, T, fb.t)[1][1] is True
 assert abs(fb.laser_need(LASER, dict(T, m={"hp": 200}), me) - 0.573) < 0.001 and fb.laser_need(LASER, None, me) == 0.75
+# Seek: a mech seen 5 s ago 100 m off is the goal; not after SEEK_S, and not once we stand where it was and it's gone.
+b.seen = {7: ([100, 0, 0], 5.0)}
+assert b.seek_goal([0, 0, 0], [0, 0], 250, 10.0) == [100, 0, 0]
+assert b.seek_goal([0, 0, 0], [0, 0], 250, 40.0) is None
+b.seen = {7: ([100, 0, 0], 5.0)}
+assert b.seek_goal([90, 0, 0], [0, 0], 250, 10.0) is None and b.seen == {}
 print("ok")

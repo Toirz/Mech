@@ -36,6 +36,7 @@ DROP_RANGE = 250.0   # m: farthest we go for a supply drop (3 cubes, full HP and
 ROAM_CELL = 40.0     # m: cells of the visited map; roaming heads for the one we left longest ago
 ROAM_REPICK = 25.0   # s: give up on a roam waypoint after this
 HIDE_HP, HEALED_HP = 0.25, 0.9  # HP fraction: hide below the first, go back out at the second
+SEEK_S, SEEK_RANGE = 30.0, 320.0  # nothing else to do and healthy: go where a mech was seen this recently (andrew-zhouu)
 FIGHT_RANGE = 150.0  # m: a seen mech this close (or one shooting us) stops the roam: stand and strafe
 ROOF_Z = 3.0         # m above the terrain: an item this high is on a roof (a jump clears 2.75 m)
 ROOF_MAX = 45.0      # m: highest roof we jet up to for loot (100 energy climbs about 60 m)
@@ -157,6 +158,7 @@ class Bot:
         self.pickups = {}                # id -> (kind, pos, t seen)
         self.cubes = {}                  # id -> (pos, t seen)
         self.crates, self.npcs = {}, {}  # id -> (pos, t seen): what we can farm for cubes
+        self.seen = {}                   # mech id -> (pos, t seen): where to go looking for the next fight
         self.bad_pickups = {}            # id -> t until we stop trying it
         self.hit_by, self.hit_on = {}, {}  # id -> last time it damaged us / we damaged it
         self.tid = None                  # id of the target we shot at last decision (kept unless another is clearly better)
@@ -181,6 +183,9 @@ class Bot:
         for k in obs["crates"]:
             self.crates[k["id"]] = (k["pos"], t)
         npcs = [m for m in obs["mechs"] if m["kind"] == "npc"]
+        for m in obs["mechs"]:
+            if m["kind"] == "mech":
+                self.seen[m["id"]] = (m["pos"], t)
         for m in npcs:
             self.npcs[m["id"]] = (m["pos"], t)
         # Close by and not listed: destroyed (a drone 40 m off would be in sensor range unless a building is between).
@@ -196,6 +201,8 @@ class Bot:
                     self.hit_by[e["by"]] = t
             elif e["type"] == "hit":
                 self.hit_on[e["target"]] = t
+            elif e["type"] == "kill":
+                self.seen.pop(e["target"], None)
             elif e["type"] == "take_failed":
                 self.bad_pickups[e["id"]] = t + 5
                 if e["reason"] == "gone":
@@ -575,6 +582,16 @@ class Bot:
         out = [p for pid, (kind, p, _) in self.pickups.items() if self.bad_pickups.get(pid, -1) < self.t and self.wants(kind, me)[0]]
         return out + ([p for p, _ in self.cubes.values()] if me["cubes"] < CUBE_KEEP else [])
 
+    def seek_goal(self, pos, c, r, t):
+        """Where the nearest mech seen in the last SEEK_S was, inside the circle and within SEEK_RANGE. Practice points are
+        house bots killed, and waiting for the next one to walk into view wastes the time between visits. Got there and
+        it isn't: forgotten."""
+        for k, (p, ts) in list(self.seen.items()):
+            if t - ts > SEEK_S or (d2(p, pos) < 22 and t - ts > 0.5):
+                del self.seen[k]
+        return min((p for p, _ in self.seen.values() if d2(p, c) < r - 6 and d2(p, pos) < SEEK_RANGE),
+                   key=lambda p: d2(p, pos), default=None)
+
     def on_roof(self, p):
         """Up on a building: above the walkable surface (ground or bridge deck; under a deck a jet only hits it)."""
         w = self.world
@@ -695,6 +712,7 @@ class Bot:
             under_fire = bool(T and T["kind"] == "mech" and T["los"] and t - self.hit_by.get(T["id"], -1e9) < 3)
             hide = self.cover_spot(pos, c, r, enemies, t) if self.hiding and not drop and not under_fire else None
             farm = self.farm_goal(me, pos, c, r, enemies) if hpf >= 0.6 and not self.hiding else None  # targets() shoots them from 0.6
+            seek = self.seek_goal(pos, c, r, t) if hpf >= 0.7 and not self.hiding else None
             calm = (not self.hiding and hpf >= 0.6 and not shot_at and not engaged
                     and not any(d2(m["pos"], pos) < ROOF_CALM for m in enemies))
             if self.climb and (t - self.climb["t0"] > ROOF_TIMEOUT or (me["grounded"] and not calm and not self.on_roof(pos))):
@@ -717,6 +735,8 @@ class Bot:
                 goal, mode = list(pos[:2]), "fight"  # stand and trade, strafing (running off loses fights)
             elif farm:
                 goal, mode, arrive = farm, "farm", 6.0  # cubes for the upgrades: shoot it, then pick them up as loot
+            elif seek:
+                goal, mode, arrive = seek, "seek", 6.0
             else:
                 roam = self.roam_goal(pos, c, r, t)
                 if roam:
@@ -782,7 +802,7 @@ class Bot:
                 aim = [self.threat[0], 0.0]
             elif self.heard and t - self.heard[1] < 2:
                 aim = [self.heard[0], 0.0]
-            elif mode in ("roam", "farm") and wants_move:  # scan: sweep +-1 rad across the way we walk
+            elif mode in ("roam", "farm", "seek") and wants_move:  # scan: sweep +-1 rad across the way we walk
                 aim = [math.atan2(move[1], move[0]) + math.sin(t * 2.0), 0.0]
             elif gap > 30 and wants_move:
                 aim = [math.atan2(move[1], move[0]), 0.0]
