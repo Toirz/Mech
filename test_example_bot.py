@@ -172,4 +172,8 @@ assert fb.weapons(me, muz, muz, T, fb.t)[1][1] is False
 T["m"]["hp"] = 1400
 assert fb.weapons(me, muz, muz, T, fb.t)[1][1] is True
 assert abs(fb.laser_need(LASER, dict(T, m={"hp": 200}), me) - 0.573) < 0.001 and fb.laser_need(LASER, None, me) == 0.75
+# A bullet that will pass 1 m north of us in 0.2 s: step south. One passing 10 m off: nothing to do.
+shot = {"kind": "gun", "pos": [50, 1, 5], "vel": [-252, 0, 0]}
+assert fb.bullet_side({"projectiles": [shot]}, {"cubes": 0}, [0, 0, 0]) == [0.0, -1.0]
+assert fb.bullet_side({"projectiles": [dict(shot, pos=[50, 10, 5])]}, {"cubes": 0}, [0, 0, 0]) is None
 print("ok")

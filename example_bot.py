@@ -478,6 +478,26 @@ class Bot:
                     return (v if v != [0.0, 0.0] else [-p["vel"][1], p["vel"][0]]), "dodge shell"
         return None
 
+    def bullet_side(self, obs, me, pos):
+        """Unit vector away from where the first bullet to reach us within 0.7 s will pass (inside our radius + 1.1 m),
+        or None. The strafe turns that way instead of waiting for its timer (giddy and andrew-zhouu dodge like this)."""
+        s = 1 + self.cfg["cubes"].get("size_per_cube", 0.05) * me.get("cubes", 0)
+        reach, top, best = self.mech["radius"] * s + 1.1, self.mech["height"] * s, None
+        for p in obs["projectiles"]:
+            v = p["vel"]
+            v2 = v[0] * v[0] + v[1] * v[1]
+            if p["kind"] == "mortar" or v2 < 1:
+                continue
+            tc = ((pos[0] - p["pos"][0]) * v[0] + (pos[1] - p["pos"][1]) * v[1]) / v2
+            mx, my = p["pos"][0] + v[0] * tc - pos[0], p["pos"][1] + v[1] * tc - pos[1]
+            if (0 < tc <= 0.7 and math.hypot(mx, my) < reach and pos[2] - 0.6 < p["pos"][2] + v[2] * tc < pos[2] + top + 0.6
+                    and (best is None or tc < best[0])):
+                best = (tc, mx, my, v)
+        if not best:
+            return None
+        away = unit(-best[1], -best[2])
+        return away if away != [0.0, 0.0] else unit(-best[3][1], best[3][0])
+
     def free_edge_spot(self, pos, c, r):
         """edge_spot, kept inside the map (the first zone is bigger than it), slid along the circle to a walkable cell."""
         spot = edge_spot(pos, c, r, EDGE_MARGIN)
@@ -745,6 +765,10 @@ class Bot:
                 if t >= self.strafe_until:
                     self.strafe_sign, self.strafe_until = -self.strafe_sign, t + self.rng.uniform(0.35, 0.9)  # reverse before their led shot lands
                 yaw = math.atan2(T["pos"][1] - y, T["pos"][0] - x) + self.strafe_sign * math.pi / 2
+                away = self.bullet_side(obs, me, pos)
+                if away and math.cos(yaw) * away[0] + math.sin(yaw) * away[1] < 0:  # a bullet will pass on the side we run to
+                    self.strafe_sign, self.strafe_until = -self.strafe_sign, t + self.rng.uniform(0.35, 0.9)
+                    yaw += math.pi
                 pull = min(gap / 6, 1.0)
                 to_spot = unit(goal[0] - x, goal[1] - y)
                 move = unit(math.cos(yaw) + to_spot[0] * pull, math.sin(yaw) + to_spot[1] * pull)
