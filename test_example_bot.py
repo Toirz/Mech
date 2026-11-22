@@ -106,6 +106,16 @@ if os.path.isdir(arena):
     assert anc and w.free(*anc) and math.dist(anc, spawn) <= ANCHOR_R and w.expo[w.nav_cell(*anc)] <= SAFE_MAX, anc
     sn = hb.safe_near(anc, 40)
     assert sn and w.expo[w.nav_cell(*sn)] <= SAFE_MAX and math.dist(sn, anc) <= 40
+# A close fight: seen within 60 m locks us in; it holds while that mech is listed within 90 m (even behind cover) and
+# ends 2 s after it isn't.
+f = Bot.__new__(Bot)
+f.close = None
+foe = {"id": 4, "kind": "mech", "los": True, "d": 50.0}
+assert not f.close_fight(dict(foe, d=80.0), [], [0, 0, 0], 10.0)        # 80 m: far, we may still choose
+assert f.close_fight(foe, [], [0, 0, 0], 10.0)                         # 50 m in sight: locked
+assert f.close_fight(None, [{"id": 4, "pos": [85, 0, 0]}], [0, 0, 0], 11.0)  # out of sight, still listed at 85 m
+assert f.close_fight(None, [], [0, 0, 0], 12.5)                        # gone 1.5 s: still on
+assert not f.close_fight(None, [], [0, 0, 0], 13.5)                    # gone 2.5 s: over
 # Roaming heads for cells we haven't been to, inside the safe circle; hiding without a map stays put.
 b = Bot.__new__(Bot)
 b.rng, b.world, b.visited, b.roam, b.roam_t = random.Random(2), None, {}, None, -1e9

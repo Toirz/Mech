@@ -1,6 +1,8 @@
 """Bot: roam the safe circle hunting lasers, cubes and supply drops; hide to heal when hurt; fight with the right weapon.
 
-Priorities each decision (movement): dodge a shell > get back in the zone > capture a supply drop
+Priorities each decision (movement): dodge a shell > get back in the zone > a close fight (a mech we see within
+CLOSE_R: there is no running from it, so we stand, strafe and shoot until it is dead or gone, whatever our HP or
+mode) > capture a supply drop
 > hide out of sight (below HIDE_HP, until HEALED_HP: silently, along safe ground, into a safe wall corner) > get away from strong mechs (and, hurt, from any mech near us)
 > run down a weak mech (healthy) > a laser in the first minute > loot on the ground > loot on a roof (only when calm:
 from within FLY_RANGE, jet straight at it and drop onto it) > stand and strafe against a mech in a fight
@@ -68,6 +70,9 @@ SWEEP, SWEEP_W = 1.2, 2.5  # rad either side of the way we face, and the sweep's
 GLANCE_EVERY = (5.0, 8.0)  # s between two looks behind
 GLANCE_S = 1.0       # s a look behind lasts (turning round takes 0.75 s at 4 rad/s)
 SILENT = 0.4         # move length that keeps us under step_speed (5 m/s): no step sounds
+CLOSE_R = 60.0       # m: a mech we see this close means a fight to the end (no hiding, evading, looting or running)
+CLOSE_KEEP = 90.0    # m: the fight goes on while that mech is listed within this...
+CLOSE_LOST_S = 2.0   # s: ...and is over once it has been off the list (or farther) this long
 OPENING_S = 110.0    # s: the opening, until the first circle has closed (hold 60 s + shrink 50 s)
 ANCHOR_R = 120.0     # m around us where the opening's safe spot is looked for
 SAFE_MAX = 8         # a cell open to fire from at most this many of 24 directions is safe ground
@@ -208,6 +213,7 @@ class Bot:
         self.visited, self.roam, self.roam_t = {}, None, -1e9  # cell -> last t there; current waypoint
         self.hiding, self.cover, self.cover_t = False, None, -1e9
         self.anchor, self.anchored = None, False  # the opening's safe spot, and whether we have got there
+        self.close = None                # (mech id, t it was last within CLOSE_KEEP): the close fight we're locked in
         self.ghosts = {}                 # the enemy map: mech id (seen) or ("h", n) (heard) -> {pos, t, r: how far off it may be}
         self.glance_next, self.glance_until, self.glance_side = 3.0, -1.0, 1
         self.heard_n = 0                 # keys of heard spots on the map: ("h", n)
@@ -730,6 +736,20 @@ class Bot:
         w = self.world
         return min((p for i, p in self.cells(pos, radius) if w.expo[i] <= SAFE_MAX), key=lambda p: d2(p, pos), default=None)
 
+    def close_fight(self, T, enemies, pos, t):
+        """Are we locked in a close fight? It starts when we see a mech within CLOSE_R (no running from one that
+        close: it shoots our back for x1.5) and lasts while that mech is listed within CLOSE_KEEP, ending CLOSE_LOST_S
+        after it isn't (dead, or gone)."""
+        if T and T["kind"] == "mech" and T["los"] and T["d"] < CLOSE_R:
+            self.close = (T["id"], t)
+        elif self.close:
+            m = next((m for m in enemies if m["id"] == self.close[0]), None)
+            if m and d2(m["pos"], pos) < CLOSE_KEEP:
+                self.close = (self.close[0], t)
+            elif t - self.close[1] > CLOSE_LOST_S:
+                self.close = None
+        return self.close is not None
+
     def hide_spot(self, pos, c, r, t):
         """Where to hide: a walkable spot within HIDE_R, inside the safe circle, with a wall or the terrain between it and
         each of the mechs we know of (the 4 nearest on our map, seen, lost or heard, and a shooter we only felt, assumed
@@ -928,7 +948,8 @@ class Bot:
                 aim = None  # behind cover there's no shot: look at the closest enemy we know of below (it may be this one)
 
         strong_T = bool(T and T["kind"] == "mech" and ((self.ghosts.get(T["id"]) or {}).get("s") or 0) > STRONG * mine)
-        if (not healthy or strong_T) and not (T and T["kind"] == "mech" and (t - self.hit_by.get(T["id"], -1e9) < 5 or T["d"] < 40)):
+        close = self.close_fight(T, enemies, pos, t)  # a mech this close: fight it out, whatever our HP or mode
+        if (not healthy or strong_T) and not close and not (T and T["kind"] == "mech" and (t - self.hit_by.get(T["id"], -1e9) < 5 or T["d"] < 40)):
             # hurt (regen needs 5 s without dealing damage), or it's strong: we start no fight; shoot only whoever is on us; a charge is held
             fire = [bool(w and w["kind"] == "laser" and w.get("charge", 0) > 0) for w in me["weapons"]]
 
@@ -975,14 +996,14 @@ class Bot:
             loot = self.loot_goal(me, pos, c, r, most, strong, around) if out else None
             early = self.early_laser(me, pos, enemies, most, strong, around) if t < EARLY_S and not shot_at and out else None
             exposed = opening and engaged and (self.expo_at(pos) or 0) >= UNSAFE  # caught in the open: no trading shots here
-            cover = (self.safe_near(pos, COVER_R) or self.anchor) if exposed else None
-            hide = self.hide_spot(pos, c, r, t) if self.hiding and not drop and not under_fire else None
+            cover = (self.safe_near(pos, COVER_R) or self.anchor) if exposed and not close else None
+            hide = self.hide_spot(pos, c, r, t) if self.hiding and not drop and not under_fire and not close else None
             # keep away from strong mechs near us; hurt, from any mech near us
             threats = [q for q in strong if d2(q, pos) < AVOID_R] + ([] if healthy else near)
             evade = (self.evade_spot(pos, c, r, threats, t) if threats and not self.hiding and not under_fire
-                     and not drop else None)
+                     and not drop and not close else None)
             chase = self.chase_goal(pos, c, r, t, mine, strong) if healthy and not evade and not opening else None
-            calm = healthy and not opening and not shot_at and not engaged and self.crowd(pos, t, ROOF_CALM) == 0
+            calm = healthy and not opening and not close and not shot_at and not engaged and self.crowd(pos, t, ROOF_CALM) == 0
             hunt = self.hunt_goal(pos, c, r, t, mine) if healthy and not opening and not (drop or early or loot or chase) else None
             if self.climb and (t - self.climb["t0"] > ROOF_TIMEOUT or (me["grounded"] and not calm and not self.on_roof(pos))):
                 self.climb = None  # trouble while still on the ground: forget the roof
@@ -990,7 +1011,9 @@ class Bot:
                 rp = self.roof_target(me, pos, c, r)
                 if rp:
                     self.climb = dict(p=rp, t0=t)
-            if drop:
+            if close:
+                goal, mode = list(pos[:2]), "close"  # a fight to the end: stand, strafe, shoot; no mode switching
+            elif drop:
                 goal, mode, arrive = drop["pos"], "drop", max(drop["radius"] - 3, 1.0)
             elif hide:
                 goal, mode, arrive = hide, "hide", 1.5
@@ -1040,7 +1063,7 @@ class Bot:
             move = self.steer(pos, goal, t, force=self.stuck_since is not None and t - self.stuck_since > 1,
                               extra=self.safety_cost(t) if mode == "hide" and self.world else None) if gap > arrive else [0.0, 0.0]
             duel = engaged and mode in ("loot", "laser", "chase", "cover", "settle") and gap > 8  # trading shots on the way: zigzag there
-            if (mode in ("edge", "fight") or duel) and T and T["kind"] == "mech" and T["los"]:  # strafe across their line of fire
+            if (mode in ("edge", "fight", "close") or duel) and T and T["kind"] == "mech" and T["los"]:  # strafe across their line of fire
                 if t >= self.strafe_until:
                     self.strafe_sign, self.strafe_until = -self.strafe_sign, t + self.rng.uniform(0.35, 0.9)  # reverse before their led shot lands
                 yaw = math.atan2(T["pos"][1] - y, T["pos"][0] - x) + self.strafe_sign * math.pi / 2
