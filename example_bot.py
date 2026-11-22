@@ -26,6 +26,8 @@ MAP_MARGIN = 15.0    # m: goals stay this far inside the map edge (a wall); the 
 MECH_SOUNDS = {"gun", "mortar", "laser", "laser_charge", "lightning", "step", "boost", "reload", "jet"}
 WEAPON_VALUE = {"laser": 1.0, "lightning": 0.7, "gun": 0.5}  # never a mortar: a laser hit on its carrier cooks off (+60%)
 EARLY_S, EARLY_RANGE = 60.0, 250.0  # the first minute: walk this far for a laser (else a lightning)
+LOOK_S = 1.6         # s: the opening full turn on the ground (turn_rate 4 rad/s)
+FLY_ENERGY, FLY_RESERVE = 90.0, 10.0  # opening look from the sky: go up with at least this much energy, jet until this is left
 GUN_OPEN = 100.0     # m: the gun doesn't start a fight with a mech farther than this (it joins one at any range)
 LATENCY = 0.03       # s from an observation to the shot leaving (the action applies on the next ticks)
 GUN_TOL = 1.0        # m: the gun fires only when its aim is this close to the lead point, at the target
@@ -164,6 +166,7 @@ class Bot:
         self.visited, self.roam, self.roam_t = {}, None, -1e9  # cell -> last t there; current waypoint
         self.hiding, self.cover, self.cover_t = False, None, -1e9
         self.climb = None                # roof loot: {p: item, t0}
+        self.fly, self.fly_t, self.fly_z = None, 0.0, 0.0  # opening look from the sky: None (not decided yet), "up", "down", "done"
         self.pred = Predictor(self.mech.get("gravity", 22), self.world.ground_at if self.world else None)
 
     # ----- memory -----
@@ -667,6 +670,20 @@ class Bot:
             # regen needs 5 s without dealing damage too: shoot only whoever is on us; a charge is held
             fire = [bool(w and w["kind"] == "laser" and w.get("charge", 0) > 0) for w in me["weapons"]]
 
+        # Opening look from the sky: if the turn on the ground showed no laser or lightning, jump and jet up (~55 m), turning,
+        # and drop back down (a turn from ~60 m up sees 77% of the ground within 200 m, from the ground 61%). We keep heading
+        # where we were going: standing still up there cost more time than the view saved. Up until the energy is spent,
+        # we're hit, or something overhead stops the climb; we keep turning until we land.
+        if self.fly is None and t >= LOOK_S:
+            go = me["grounded"] and me["energy"] >= FLY_ENERGY and self.threat is None and not self.early_laser(me, pos, enemies)
+            self.fly, self.fly_t = "up" if go else "done", t
+        elif self.fly == "up" and (me["energy"] <= FLY_RESERVE or (self.threat and self.threat[1] >= self.fly_t) or t - self.fly_t > 9
+                                   or (t - self.fly_t > 0.6 and not me["grounded"] and z - self.fly_z < 0.05)):  # stuck under something
+            self.fly = "down"
+        elif self.fly == "down" and me["grounded"]:
+            self.fly = "done"
+        self.fly_z = z
+
         # Movement goal.
         c, r = zone_at(obs["zone"], t + LOOKAHEAD_S)
         spot = self.free_edge_spot(pos, c, r)
@@ -722,8 +739,11 @@ class Bot:
                 if roam:
                     goal, mode, arrive = roam, "roam", 6.0
 
+        if self.fly == "up":  # going up, still on our way: straight at the goal over whatever is below (air control)
+            mode = "fly"
+            move = unit(goal[0] - x, goal[1] - y) if d2(goal, pos) > arrive else [0.0, 0.0]
         gap = d2(goal, pos)
-        climbing = False
+        climbing = self.fly == "up"
         if move is None and mode == "roof":
             top, ms = goal[2], self.mech
             # jet time to get over it: rising to its height or crossing the gap, whichever is longer, plus a margin
@@ -768,7 +788,8 @@ class Bot:
                 self.unstick_dir, self.unstick_until = [math.cos(a), math.sin(a)], t + 1.0
                 self.stuck_since, self.path = None, []
         boost = climbing or mode in ("dodge shell", "zone") or (stuck and not fighting) or (
-            gap > 40 and me["energy"] > 60 and not T and mode != "roof")  # save the energy for the jet
+            gap > 40 and me["energy"] > 60 and not T and mode != "roof"  # save the energy for the jet
+            and (self.fly == "done" or self.fly is None and mode == "laser"))  # and for the opening look up; in the air it's a jet
         if fighting:  # boost through the whole fight, walking just long enough to recharge (duel-tested; jets lost)
             self.burn = me["energy"] > 70 if not self.burn else me["energy"] > 25
             boost = boost or (self.burn and me["grounded"])
@@ -776,7 +797,7 @@ class Bot:
         # Where to look when there's nothing to shoot.
         if aim is None:
             inward = math.atan2(c[1] - y, c[0] - x)
-            if t < 1.6:  # a full turn at spawn (turn_rate 4 rad/s): see the loot behind us too
+            if t < LOOK_S:  # a full turn at spawn (turn_rate 4 rad/s): see the loot behind us too
                 aim = [me["aim"][0] + 1.0, 0.0]
             elif self.threat and t - self.threat[1] < 3:  # turn to face whoever hit us
                 aim = [self.threat[0], 0.0]
@@ -788,6 +809,9 @@ class Bot:
                 aim = [math.atan2(move[1], move[0]), 0.0]
             else:
                 aim = [inward, 0.0]  # back to the zone edge: enemies come from inside
+        if self.fly in ("up", "down") and not (self.threat and t - self.threat[1] < 3):
+            aim = [me["aim"][0] + 1.0, 0.0]  # up there keep turning (pitch doesn't matter: the view wedge is by yaw only)
+            fire = [bool(w and w["kind"] == "laser" and w.get("charge", 0) > 0) for w in me["weapons"]]
 
         act.update(move=move, boost=boost, jump=jump, aim=aim, fire=fire, reload=reload)
         if DEBUG and obs["tick"] % 200 == 0 and self.dbg:

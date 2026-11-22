@@ -172,4 +172,47 @@ assert fb.weapons(me, muz, muz, T, fb.t)[1][1] is False
 T["m"]["hp"] = 1400
 assert fb.weapons(me, muz, muz, T, fb.t)[1][1] is True
 assert abs(fb.laser_need(LASER, dict(T, m={"hp": 200}), me) - 0.573) < 0.001 and fb.laser_need(LASER, None, me) == 0.75
+
+# Opening look from the sky, as whole decisions without a map (straight lines, everything in the open).
+CFG = {"mech": {"radius": 2.5, "height": 9, "eye_height": 8, "max_pitch": 1.3, "gravity": 22, "walk_speed": 11.7},
+       "weapons": {"mortar": {"gravity": 22, "splash_radius": 7}, "lightning": {"short_s": 2}}, "loot": {"pickup_radius": 4},
+       "cubes": {"size_per_cube": 0.05, "damage_per_cube": 0.04, "stat_cap": 10}, "npc": {"radius": 1.8, "height": 3.5, "cubes": 2},
+       "crates": {"radius": 1.4, "height": 2.4, "cubes": 1}, "projectile": {"gun_radius": 0.3}, "match": {"tick_hz": 20}}
+
+
+def opening(t, energy=100, grounded=True, vz=0.0, fly=None, pickups=(), events=()):
+    with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):  # "map not loaded"
+        bot = Bot({"config": CFG, "seed": 1, "map": {"dir": "/nonexistent"}})
+    bot.fly, bot.fly_t = fly, 1.6
+    o = {"tick": int(t * 20), "t": t, "alive": 16, "mechs": [], "projectiles": [], "crates": [], "cubes": [], "sounds": [],
+         "beams": [], "pickups": list(pickups), "events": list(events), "drops": [], "offer": None,
+         "zone": {"center": [0, 0], "radius": 500, "next_center": [0, 0], "next_radius": 400, "shrink_start": 200, "shrink_end": 250},
+         "self": {"id": 0, "pos": [0, 0, 0], "vel": [0, 0, vz], "aim": [0.5, 0], "hp": 1400, "max_hp": 1400, "energy": energy,
+                  "grounded": grounded, "cubes": 0, "upgrades": [], "in_zone": True, "weapons": [dict(GUN), None],
+                  "stats": {"walk_speed": 11.7, "turn_rate": 4, "pitch_rate": 3, "muzzle_height": 7, "height": 9}}}
+    a = bot.act(o)
+    return __import__("mechfight").draw.take()["label"].split(" ")[0], a, bot
+
+
+# While the ground turn runs, no roam boost: the energy is for the climb.
+mode, a, bot = opening(1.0)
+assert bot.fly is None and not a["boost"], (mode, a)
+# The turn showed no weapon: jump and jet, turning (aim 0.5 -> 1.5), heading for the roam waypoint.
+mode, a, bot = opening(1.6)
+assert bot.fly == "up" and mode == "fly" and a["jump"] and a["boost"] and abs(a["aim"][0] - 1.5) < 1e-9, (mode, a)
+assert math.hypot(*a["move"]) > 0.99
+# A laser in sight on the ground: no flight, go and get it.
+mode, a, bot = opening(1.6, pickups=[{"id": 8001, "kind": "laser", "pos": [80, 0, 0]}])
+assert bot.fly == "done" and mode == "laser" and not a["jump"], (mode, a)
+# Up there: out of energy, or something overhead stopped the climb (no height gained since the last decision) -> drop, still turning.
+for kw in (dict(energy=9, vz=8.0), dict(vz=0.0)):
+    mode, a, bot = opening(3.0, grounded=False, fly="up", **kw)
+    assert bot.fly == "down" and not a["boost"] and abs(a["aim"][0] - 1.5) < 1e-9, (kw, mode, a)
+# Hit on the way up: drop at once and face the shot instead of turning.
+mode, a, bot = opening(3.0, grounded=False, fly="up", vz=8.0, events=[{"type": "damaged", "amount": 45, "weapon": "gun",
+                                                                       "bearing": 2.0, "by": 5}])
+assert bot.fly == "down" and not a["boost"] and a["aim"][0] == 2.0, (mode, a)
+# Landed: done.
+mode, a, bot = opening(9.0, fly="down")
+assert bot.fly == "done" and mode != "fly"
 print("ok")
