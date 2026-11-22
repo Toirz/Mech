@@ -5,10 +5,6 @@ Priorities each decision (movement): dodge a shell > get back in the zone > capt
 > loot on a roof (only when calm: from within FLY_RANGE, jet straight at it and drop onto it) > stand and strafe against a mech in a fight
 > farm a drone or crate we saw (most cubes per metre; shot on the way, its cubes picked up as loot)
 > roam to the least recently visited cell (scanning).
-
-Where we look with nothing to shoot: whoever just hit us > roaming or farming: a mech sound just heard, else the scan
-(it finds loot) > the closest spot on the enemy map (a mech we see, lost or heard in the last FACE_S), at body height
-> the way we walk > inward from the zone edge.
 """
 import math
 import random
@@ -24,7 +20,6 @@ LOOT_RANGE = 200.0   # m: farthest we walk for a weapon or cube (roaming: we go 
 CUBE_KEEP = 15       # past this, cubes only make us bigger (stats cap at 10; 15 = one more upgrade)
 FARM_GUARD = 100.0   # m: a drone or crate this close to a mech we see isn't worth the walk
 FARM_S = 120.0       # s we remember a drone or crate we saw (crates stay put, drones keep near their home)
-FACE_S = 10.0        # s: a mech we lost from view or heard this recently is where we aim while there's nothing to shoot
 MORTAR_MIN = 20.0    # m: closer than this our own splash and knockback hurt us
 PATH_BUDGET = 0.01   # s of A* per decision (the whole decision must fit in 50 ms)
 MAP_MARGIN = 15.0    # m: goals stay this far inside the map edge (a wall); the first zone is bigger than the map
@@ -153,8 +148,7 @@ class Bot:
         self.unstick_until, self.unstick_dir = -1.0, [0.0, 0.0]
         self.threat = None               # (bearing, t) of the last hit we took
         self.turn_to = None              # (bearing, t): hit in the back by someone we can't see: face that way a moment
-        self.heard = None                # (bearing, t, guessed m) of the closest mech sound we last heard
-        self.ghosts, self.heard_n = {}, 0  # the enemy map: mech id (seen) or ("h", n) (heard) -> {pos, t, r: how far off}
+        self.heard = None                # (bearing, t, dist) of the last mech sound
         self.strafe_sign, self.strafe_until = 1, 0.0
         self.burn = True  # boosting in a fight: on until energy drops to 25, back on at 70
         self.vhist = {}  # target id -> [(t, its velocity)] over the last 2 s
@@ -191,14 +185,8 @@ class Bot:
         seen_k, seen_n = {k["id"] for k in obs["crates"]}, {m["id"] for m in npcs}
         self.crates = {k: v for k, v in self.crates.items() if (k in seen_k or d2(v[0], pos) > 25) and t - v[1] < FARM_S}
         self.npcs = {k: v for k, v in self.npcs.items() if (k in seen_n or d2(v[0], pos) > 40) and t - v[1] < FARM_S}
-        for m in obs["mechs"]:  # listed: in view, or still tracked by the server for 5 s behind cover
-            if m["kind"] == "mech":
-                self.ghosts[m["id"]] = {"pos": list(m["pos"]), "t": t, "r": 0.0}
-        self.ghosts = {k: g for k, g in self.ghosts.items() if t - g["t"] < FACE_S}
         for e in obs["events"]:
-            if e["type"] == "kill":
-                self.ghosts.pop(e["target"], None)
-            elif e["type"] == "damaged" and e.get("bearing") is not None:
+            if e["type"] == "damaged" and e.get("bearing") is not None:
                 self.threat = (e["bearing"], t)
                 if e.get("rear"):
                     self.turn_to = (e["bearing"], t)
@@ -214,53 +202,13 @@ class Bot:
                 self.pickups.pop(e["id"], None)
             elif e["type"] == "effect" and e["effect"] == "short":
                 self.short_until = t + self.cfg["weapons"]["lightning"].get("short_s", 2)
-        heard = [(self.hear(s, pos, t), s) for s in obs["sounds"] if s["kind"] in MECH_SOUNDS]
-        if heard:
-            d, s = min(heard, key=lambda e: (e[0], e[1]["age"]))
-            self.heard = (s["bearing"], t - s["age"], d)
+        sounds = [s for s in obs["sounds"] if s["kind"] in MECH_SOUNDS]
+        if sounds:
+            s = min(sounds, key=lambda s: (["near", "mid", "far"].index(s["dist"]), s["age"]))
+            self.heard = (s["bearing"], t - s["age"], s["dist"])
 
     def los(self, a, b):
         return self.world.clear(a, b) if self.world else True
-
-    def hear(self, s, pos, t):
-        """Put a mech sound on the enemy map: along its bearing, at the middle of its distance class (capped by
-        how far that kind carries), off by half the class plus the bearing noise. Near a spot already on the map
-        it moves that spot (a listed mech made it: nothing to learn). Returns the guessed distance."""
-        S = self.cfg["sound"]
-        reach = S["range"].get(s["kind"], S["mid"])
-        lo, hi = {"near": (0.0, S["near"]), "mid": (S["near"], S["mid"])}.get(s["dist"], (S["mid"], max(reach, S["mid"])))
-        hi = min(hi, reach)
-        lo = min(lo, hi)
-        d, ts = (lo + hi) / 2, t - s["age"]
-        q = [pos[0] + d * math.cos(s["bearing"]), pos[1] + d * math.sin(s["bearing"]), 0.0]
-        q[2] = self.world.ground_at(q[0], q[1], pos[2]) if self.world else pos[2]
-        u = (hi - lo) / 2 + d * math.radians(S.get("bearing_noise_deg", 7)) * 2
-        near = min(self.ghosts.values(), key=lambda g: d2(g["pos"], q), default=None)
-        if near and d2(near["pos"], q) < u + near["r"] + 20:
-            if near["t"] < t and ts > near["t"]:
-                if u < near["r"] + 6.0 * (ts - near["t"]):  # the sound pins it down better than the old spot
-                    near["pos"], near["r"] = q, u
-                near["t"] = ts
-            return d
-        self.heard_n += 1
-        self.ghosts[("h", self.heard_n)] = {"pos": q, "t": ts, "r": u}
-        return d
-
-    def clear_ghosts(self, pos, t):
-        """Forget a spot on the map that isn't listed now but lies within the all-round near range (where only
-        buildings hide a mech) with a clear line to it: whatever made it has gone. A rough heard spot just expires.
-        shortcut: spots in view beyond the near range aren't cleared (no tree model here); they expire after FACE_S,
-        port World.sees from c590ccc if aiming at stale spots shows up."""
-        near, mid = self.cfg["vision"]["near_range"] - 5, self.mech["height"] / 2
-        eye = [pos[0], pos[1], pos[2] + self.mech.get("eye_height", 8)]
-        for k, g in list(self.ghosts.items()):
-            q = g["pos"]
-            if g["t"] < t and g["r"] <= 40 and d2(q, pos) < near and self.los(eye, [q[0], q[1], q[2] + mid]):
-                del self.ghosts[k]
-
-    def foe_spot(self, pos):
-        """The closest spot on the enemy map (a mech we see, lost in the last FACE_S, or heard), or None."""
-        return min((g["pos"] for g in self.ghosts.values()), key=lambda q: d2(q, pos), default=None)
 
     # ----- weapons -----
     def wants(self, kind, me):
@@ -655,7 +603,6 @@ class Bot:
         x, y, z = pos
         t = self.t = obs["t"]
         self.remember(obs, t, pos)
-        self.clear_ghosts(pos, t)
         spc = self.cfg["cubes"].get("size_per_cube", 0.05)
         for m in obs["mechs"]:  # feed the motion predictor (and score it in hindsight)
             r = self.mech["radius"] * (1 + spc * m.get("cubes", 0)) if m["kind"] == "mech" else self.cfg["npc"]["radius"]
@@ -811,18 +758,14 @@ class Bot:
         # Where to look when there's nothing to shoot.
         if aim is None:
             inward = math.atan2(c[1] - y, c[0] - x)
-            foe = self.foe_spot(pos)
             if t < 1.6:  # a full turn at spawn (turn_rate 4 rad/s): see the loot behind us too
                 aim = [me["aim"][0] + 1.0, 0.0]
             elif self.threat and t - self.threat[1] < 3:  # turn to face whoever hit us
                 aim = [self.threat[0], 0.0]
-            elif mode in ("roam", "farm") and wants_move:  # scan: sweep +-1 rad across the way we walk (finds loot)
-                fresh = self.heard and t - self.heard[1] < 2  # ...unless a mech sound was just heard
-                aim = [self.heard[0], 0.0] if fresh else [math.atan2(move[1], move[0]) + math.sin(t * 2.0), 0.0]
-            elif foe:  # crosshair on the closest spot on the enemy map (sounds are on it too), at body height
-                aim = aim_at(muzzle, [foe[0], foe[1], foe[2] + self.mech["height"] / 2])
-            elif self.heard and t - self.heard[1] < 2:  # a sound whose spot was cleared at once
+            elif self.heard and t - self.heard[1] < 2:
                 aim = [self.heard[0], 0.0]
+            elif mode in ("roam", "farm") and wants_move:  # scan: sweep +-1 rad across the way we walk
+                aim = [math.atan2(move[1], move[0]) + math.sin(t * 2.0), 0.0]
             elif gap > 30 and wants_move:
                 aim = [math.atan2(move[1], move[0]), 0.0]
             else:
