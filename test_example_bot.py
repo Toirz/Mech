@@ -94,4 +94,9 @@ gun = {"weapons": [{"kind": "gun"}, None], "upgrades": []}
 assert b.pick_upgrade(["gun_rate", "armor", "gun_mag"], gun) == 2
 assert b.pick_upgrade(["gun_mag", "plating", "servos"], gun) == 1
 assert b.pick_upgrade(["gun_damage", "gun_mag", "sensors"], dict(gun, upgrades=["gun_mag", "gun_mag"])) == 0  # gun_mag maxed
+# With a laser: two laser_damage before the first plating, then plating comes back first.
+laser = {"weapons": [{"kind": "gun"}, {"kind": "laser"}], "upgrades": []}
+assert b.pick_upgrade(["plating", "gun_mag", "laser_damage"], laser) == 2
+assert b.pick_upgrade(["plating", "gun_mag", "laser_damage"], dict(laser, upgrades=["laser_damage"])) == 2
+assert b.pick_upgrade(["plating", "gun_mag", "laser_damage"], dict(laser, upgrades=["laser_damage", "laser_damage"])) == 0
 print("ok")
