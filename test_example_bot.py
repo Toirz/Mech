@@ -172,4 +172,8 @@ assert fb.weapons(me, muz, muz, T, fb.t)[1][1] is False
 T["m"]["hp"] = 1400
 assert fb.weapons(me, muz, muz, T, fb.t)[1][1] is True
 assert abs(fb.laser_need(LASER, dict(T, m={"hp": 200}), me) - 0.573) < 0.001 and fb.laser_need(LASER, None, me) == 0.75
+# A mech at 28% HP 200 m off beats a fresh one 80 m off (giddy: -200 m for <= 30% HP; andrew-zhouu: x3).
+fb.tid, fb.hit_by = None, {}
+obs = {"mechs": [mech(10, [-200, 0, 0], hp=400), mech(11, [-80, 0, 0])], "crates": [], "beams": []}
+assert fb.targets(obs, me, muz, 1.0)["id"] == 10
 print("ok")
