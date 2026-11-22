@@ -172,4 +172,25 @@ assert fb.weapons(me, muz, muz, T, fb.t)[1][1] is False
 T["m"]["hp"] = 1400
 assert fb.weapons(me, muz, muz, T, fb.t)[1][1] is True
 assert abs(fb.laser_need(LASER, dict(T, m={"hp": 200}), me) - 0.573) < 0.001 and fb.laser_need(LASER, None, me) == 0.75
+# Lobby: a death we didn't cause in the first 35 s is a free-for-all; one we caused, or one at 120 s, isn't; nor one
+# just after we hit a mech that is out of view (finished by something else).
+lb = Bot.__new__(Bot)
+lb.cfg, lb.hit_on, lb.ffa, lb.kills, lb.dead_seen, lb.absorbed = {"match": {"mechs": 16}}, {}, False, 0, 0, 0
+lb.lobby({"alive": 15, "mechs": []}, 18.0)
+assert lb.ffa
+lb.ffa, lb.dead_seen, lb.kills = False, 0, 1
+lb.lobby({"alive": 15, "mechs": []}, 18.0)
+assert not lb.ffa
+lb.kills, lb.dead_seen = 0, 0
+lb.lobby({"alive": 15, "mechs": []}, 120.0)
+assert not lb.ffa
+lb.dead_seen, lb.hit_on = 0, {4: 17.0}
+lb.lobby({"alive": 15, "mechs": []}, 18.0)
+assert not lb.ffa and lb.absorbed == 1
+# Free-for-all fire: a far mech that hasn't touched us is left alone, unless we hold a laser and it doesn't.
+fb.hit_by = {}
+T = fb.targets({"mechs": [dict(mech(3, [-120, 0, 0]), weapons=["gun", "laser"])], "crates": [], "beams": []}, me, muz, 1.0)
+assert not fb.hostile(T, me) and fb.hostile(dict(T, d=30), me)
+T["m"]["weapons"] = ["gun"]
+assert fb.hostile(T, me) and not fb.hostile(T, gun_only)
 print("ok")

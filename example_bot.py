@@ -36,6 +36,10 @@ DROP_RANGE = 250.0   # m: farthest we go for a supply drop (3 cubes, full HP and
 ROAM_CELL = 40.0     # m: cells of the visited map; roaming heads for the one we left longest ago
 ROAM_REPICK = 25.0   # s: give up on a roam waypoint after this
 HIDE_HP, HEALED_HP = 0.25, 0.9  # HP fraction: hide below the first, go back out at the second
+# Free-for-all (other teams' bots, as in the final): told by deaths we didn't cause, which the practice squad never has.
+FFA_LOOT, FFA_DROP = 100.0, 100.0  # m: short errands only (long walks to drops cost top-4 finishes: andrew-zhouu)
+FFA_HIDE_HP = 0.5    # hide to heal from here: placement is survival
+FFA_HOSTILE_S, FFA_CLOSE = 8.0, 45.0  # a mech that hit us this recently, or is this close, is in a fight with us
 FIGHT_RANGE = 150.0  # m: a seen mech this close (or one shooting us) stops the roam: stand and strafe
 ROOF_Z = 3.0         # m above the terrain: an item this high is on a roof (a jump clears 2.75 m)
 ROOF_MAX = 45.0      # m: highest roof we jet up to for loot (100 energy climbs about 60 m)
@@ -164,6 +168,7 @@ class Bot:
         self.visited, self.roam, self.roam_t = {}, None, -1e9  # cell -> last t there; current waypoint
         self.hiding, self.cover, self.cover_t = False, None, -1e9
         self.climb = None                # roof loot: {p: item, t0}
+        self.ffa, self.kills, self.dead_seen, self.absorbed = False, 0, 0, 0  # lobby(): free-for-all or practice squad
         self.pred = Predictor(self.mech.get("gravity", 22), self.world.ground_at if self.world else None)
 
     # ----- memory -----
@@ -196,6 +201,8 @@ class Bot:
                     self.hit_by[e["by"]] = t
             elif e["type"] == "hit":
                 self.hit_on[e["target"]] = t
+            elif e["type"] == "kill":
+                self.kills += 1
             elif e["type"] == "take_failed":
                 self.bad_pickups[e["id"]] = t + 5
                 if e["reason"] == "gone":
@@ -208,6 +215,31 @@ class Bot:
         if sounds:
             s = min(sounds, key=lambda s: (["near", "mid", "far"].index(s["dist"]), s["age"]))
             self.heard = (s["bearing"], t - s["age"], s["dist"])
+
+    def lobby(self, obs, t):
+        """Free-for-all or the practice squad? The squad never kills its own, so a death we didn't cause is another team's
+        bot: one before 35 s or two before 110 s (in 153 recorded free-for-alls the first came at 13 s median, never after
+        45 s: andrew-zhouu). A death just after we hit a mech that is out of view is taken for ours (finished by a drone).
+        Never decided after 110 s, when the zone may be killing: practice keeps playing exactly as before."""
+        dead = self.cfg["match"].get("mechs", 16) - obs["alive"]
+        if dead > self.dead_seen:
+            shown = {m["id"] for m in obs["mechs"]}
+            if dead - self.kills - self.absorbed > 0 and any(i < 100 and t - ts < 6 and i not in shown for i, ts in self.hit_on.items()):
+                self.absorbed += 1
+            self.dead_seen = dead
+        u = dead - self.kills - self.absorbed
+        if (u >= 1 and t < 35) or (u >= 2 and t < 110):
+            self.ffa = True
+
+    def laser_edge(self, T, me):
+        return any(w and w["kind"] == "laser" for w in me["weapons"]) and "laser" not in T["m"].get("weapons", [])
+
+    def hostile(self, T, me):
+        """Free-for-all: shoot only a mech in a fight with us. It hit us lately, it is close, it is nearly dead, or we hold
+        a laser and it doesn't (andrew-zhouu's real matches: firing first pays only then)."""
+        m = T["m"]
+        return (self.t - self.hit_by.get(T["id"], -1e9) < FFA_HOSTILE_S or T["d"] < FFA_CLOSE or self.laser_edge(T, me)
+                or m.get("hp", 1400) <= 0.3 * m.get("max_hp", 1400))
 
     def los(self, a, b):
         return self.world.clear(a, b) if self.world else True
@@ -620,6 +652,7 @@ class Bot:
         x, y, z = pos
         t = self.t = obs["t"]
         self.remember(obs, t, pos)
+        self.lobby(obs, t)
         spc = self.cfg["cubes"].get("size_per_cube", 0.05)
         for m in obs["mechs"]:  # feed the motion predictor (and score it in hindsight)
             r = self.mech["radius"] * (1 + spc * m.get("cubes", 0)) if m["kind"] == "mech" else self.cfg["npc"]["radius"]
@@ -659,12 +692,15 @@ class Bot:
             aim = [self.turn_to[0], 0.0]  # hit in the back (x1.5) by someone we don't have in front of us: turn round now
             fire = [bool(w and w["kind"] == "laser" and w.get("charge", 0) > 0) for w in me["weapons"]]  # nothing leaves off-aim; a charge is held
 
-        if hpf < HIDE_HP:
+        if hpf < (FFA_HIDE_HP if self.ffa else HIDE_HP):
             self.hiding = True
         elif hpf >= HEALED_HP:
             self.hiding = False
         if self.hiding and not (T and T["kind"] == "mech" and (t - self.hit_by.get(T["id"], -1e9) < 5 or T["d"] < 40)):
             # regen needs 5 s without dealing damage too: shoot only whoever is on us; a charge is held
+            fire = [bool(w and w["kind"] == "laser" and w.get("charge", 0) > 0) for w in me["weapons"]]
+        if self.ffa and T and T["kind"] == "mech" and not self.hostile(T, me):
+            # free-for-all: being looked at is not being attacked; a charge is held
             fire = [bool(w and w["kind"] == "laser" and w.get("charge", 0) > 0) for w in me["weapons"]]
 
         # Movement goal.
@@ -681,20 +717,25 @@ class Bot:
             drop = None
             for dr in obs.get("drops", []):
                 dd = d2(dr["pos"], pos)
-                if (dr["holder"] in (None, me["id"]) and dd < DROP_RANGE and d2(dr["pos"], c) < r - 3
+                if (dr["holder"] in (None, me["id"]) and dd < (FFA_DROP if self.ffa else DROP_RANGE) and d2(dr["pos"], c) < r - 3
                         and dr["lands_in"] <= dd / st.get("walk_speed", 11.7) + 10
                         and not any(d2(m["pos"], dr["pos"]) < 60 for m in enemies)):
                     drop = dr
                     break
             loot = None if (near and d2(near["pos"], pos) < 70) or hpf < 0.35 else self.loot_goal(me, pos, c, r)
+            if self.ffa and loot and d2(loot, pos) > FFA_LOOT:
+                loot = None
             shot_at = self.threat is not None and t - self.threat[1] < 3
             early = self.early_laser(me, pos, enemies) if t < EARLY_S and not shot_at else None
             engaged = bool(T and T["kind"] == "mech" and T["los"]
                            and (T["d"] < FIGHT_RANGE or t - self.hit_by.get(T["id"], -1e9) < 3))
             # shot by a mech we can see: stand and trade (running shows it our back, x1.5); hide once it lets up
             under_fire = bool(T and T["kind"] == "mech" and T["los"] and t - self.hit_by.get(T["id"], -1e9) < 3)
-            hide = self.cover_spot(pos, c, r, enemies, t) if self.hiding and not drop and not under_fire else None
-            farm = self.farm_goal(me, pos, c, r, enemies) if hpf >= 0.6 and not self.hiding else None  # targets() shoots them from 0.6
+            # free-for-all: shot at from range without a laser edge, get out of its line, shooting back (andrew-zhouu, 1,463
+            # first hits in real matches: out of sight within seconds 77% alive 20 s later, stayed and shot back 55%)
+            slip = self.ffa and under_fire and T["d"] > FFA_CLOSE and not self.laser_edge(T, me)
+            hide = self.cover_spot(pos, c, r, enemies, t) if (self.hiding or slip) and not drop and (not under_fire or slip) else None
+            farm = self.farm_goal(me, pos, c, r, enemies) if hpf >= 0.6 and not self.hiding and not self.ffa else None  # targets() shoots them from 0.6
             calm = (not self.hiding and hpf >= 0.6 and not shot_at and not engaged
                     and not any(d2(m["pos"], pos) < ROOF_CALM for m in enemies))
             if self.climb and (t - self.climb["t0"] > ROOF_TIMEOUT or (me["grounded"] and not calm and not self.on_roof(pos))):
@@ -717,7 +758,7 @@ class Bot:
                 goal, mode = list(pos[:2]), "fight"  # stand and trade, strafing (running off loses fights)
             elif farm:
                 goal, mode, arrive = farm, "farm", 6.0  # cubes for the upgrades: shoot it, then pick them up as loot
-            else:
+            elif not self.ffa:  # free-for-all: hold the zone edge instead of walking into fights
                 roam = self.roam_goal(pos, c, r, t)
                 if roam:
                     goal, mode, arrive = roam, "roam", 6.0
@@ -805,7 +846,7 @@ class Bot:
         mf.draw.point([goal[0], goal[1], z], "#40c0ff", 6)
         if T:
             mf.draw.line(muzzle, T["c"], "#ff5040" if T["los"] else "#806060")
-        mf.draw.label(f"{mode} · hp {me['hp']:.0f} · {T['kind'] + ' ' + str(T['id']) if T else '-'}")
+        mf.draw.label(f"{'ffa ' if self.ffa else ''}{mode} · hp {me['hp']:.0f} · {T['kind'] + ' ' + str(T['id']) if T else '-'}")
 
 
 if __name__ == "__main__":
