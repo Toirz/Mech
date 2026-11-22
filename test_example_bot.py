@@ -4,6 +4,14 @@ import os
 import random
 
 from example_bot import Bot, aim_at, edge_spot, lead, mortar_aim, shell_landing, zone_at
+from threat import Threats
+
+CFG = {"weapons": {"gun": {"damage": 45, "cooldown": 0.24, "mag": 12, "reload": 2.4, "range": 230},
+                   "laser": {"damage": 315, "charge": 0.75, "cooldown": 1.65, "range": 280},
+                   "lightning": {"damage": 240, "cooldown": 1.2, "energy": 30, "range": 45},
+                   "mortar": {"damage": 260, "splash": 160, "cooldown": 2.5, "speed": 72, "gravity": 22}},
+       "mech": {"energy_regen": 20, "rear_mult": 1.5}, "cubes": {"damage_per_cube": 0.04, "stat_cap": 10},
+       "vision": {"range": 195}}
 
 zone = {"center": [0, 0], "radius": 500, "next_center": [100, 0], "next_radius": 300, "shrink_start": 60, "shrink_end": 110}
 assert zone_at(zone, 0) == ([0, 0], 500)
@@ -77,6 +85,7 @@ assert b.roam_goal([1, 1, 0], [0, 0], 250, 101.0) == g  # keeps its waypoint unt
 assert b.cover_spot([5, 6, 0], [0, 0], 250, [{"pos": [50, 0, 0]}], 0.0) == [5, 6]
 # Farming: drones and crates we saw are remembered until we're close and they're gone; the trip worth most cubes per metre wins.
 b.cfg = {"npc": {"cubes": 2}, "crates": {"cubes": 1}}
+b.threats, b.errors, b.t = Threats(CFG), {}, 0.0
 b.pickups, b.cubes, b.crates, b.npcs = {}, {}, {}, {}
 seen = {"pickups": [], "cubes": [], "events": [], "sounds": [], "crates": [{"id": 1000, "pos": [60, 0, 0], "hp": 300}],
         "mechs": [{"id": 100, "kind": "npc", "pos": [-100, 0, 0]}]}
@@ -126,6 +135,7 @@ def fight_bot():
     fb.mech = {"radius": 2.5, "height": 9, "eye_height": 8, "max_pitch": 1.3}
     fb.world, fb.pred, fb.t = Walls(), Predictor(22.0), 10.0
     fb.hit_by, fb.hit_on, fb.tid, fb.vhist, fb.short_until, fb.dbg = {}, {}, None, {}, 0.0, {}
+    fb.threats, fb.errors = Threats(CFG), {}
     return fb
 
 

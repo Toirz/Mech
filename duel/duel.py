@@ -35,7 +35,7 @@ REPO = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 import sim  # noqa: E402
 
-BOT_FILES = ["example_bot.py", "world.py", "mechfight.py", "predict.py"]
+BOT_FILES = ["example_bot.py", "world.py", "mechfight.py", "predict.py", "threat.py"]
 CACHE = os.path.join(HERE, ".bots")
 LOADOUTS = {"gun": ["gun", None], "gun+laser": ["gun", "laser"], "gun+lightning": ["gun", "lightning"], "gun+mortar": ["gun", "mortar"]}
 
