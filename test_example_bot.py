@@ -172,4 +172,9 @@ assert fb.weapons(me, muz, muz, T, fb.t)[1][1] is False
 T["m"]["hp"] = 1400
 assert fb.weapons(me, muz, muz, T, fb.t)[1][1] is True
 assert abs(fb.laser_need(LASER, dict(T, m={"hp": 200}), me) - 0.573) < 0.001 and fb.laser_need(LASER, None, me) == 0.75
+# One shot from dead: a 200 HP mech 150 m off dies to a ready beam (315 x 0.75), 250 HP doesn't; 120 HP dies to the gun at 50 m.
+T = fb.targets({"mechs": [mech(3, [-150, 0, 0], hp=200)], "crates": [], "beams": []}, me, muz, 1.0)
+assert fb.killable(T, me) and not fb.killable(dict(T, m=dict(T["m"], hp=250)), me)
+T = fb.targets({"mechs": [mech(3, [-50, 0, 0], hp=120)], "crates": [], "beams": []}, gun_only, muz, 1.0)
+assert fb.killable(T, gun_only) and not fb.killable(dict(T, d=80), gun_only)
 print("ok")

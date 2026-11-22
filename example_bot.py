@@ -391,6 +391,20 @@ class Bot:
         lo = st.get("min_frac", 0.35)  # damage share at no charge, rising linearly to 1 at full
         return min(max((hp / dmg - lo) / (1 - lo) * st["charge"], st.get("min_charge", 0.15)), st["charge"])
 
+    def killable(self, T, me):
+        """T dies to what we have ready: one full beam, or four rounds within 60 m (both through full armor)."""
+        hp = T["m"].get("hp") if T and T["kind"] == "mech" and T["los"] else None
+        if hp is None:
+            return False
+        cu = self.cfg["cubes"]
+        mul = (1 + cu.get("damage_per_cube", 0.04) * min(me.get("cubes", 0), cu.get("stat_cap", 10))) * KILL_MARGIN
+        for w in me["weapons"]:
+            if w and w["kind"] == "laser" and w["cooldown"] <= 0.3 and T["d"] <= w["stats"]["range"] and hp <= w["stats"]["damage"] * mul:
+                return True
+            if w and w["kind"] == "gun" and w.get("ammo", 0) >= 4 and T["d"] <= 60 and hp <= 4 * w["stats"]["damage"] * mul:
+                return True
+        return False
+
     def point_at(self, T, tau, hgt):
         """T's predicted position after tau s, hgt m above its feet."""
         p, _ = self.pred.predict(T["id"], T["pos"], T["vel"], tau)
@@ -663,7 +677,8 @@ class Bot:
             self.hiding = True
         elif hpf >= HEALED_HP:
             self.hiding = False
-        if self.hiding and not (T and T["kind"] == "mech" and (t - self.hit_by.get(T["id"], -1e9) < 5 or T["d"] < 40)):
+        finish = self.hiding and self.killable(T, me)  # a hunter left one shot from dead is a point: take it before hiding
+        if self.hiding and not finish and not (T and T["kind"] == "mech" and (t - self.hit_by.get(T["id"], -1e9) < 5 or T["d"] < 40)):
             # regen needs 5 s without dealing damage too: shoot only whoever is on us; a charge is held
             fire = [bool(w and w["kind"] == "laser" and w.get("charge", 0) > 0) for w in me["weapons"]]
 
@@ -693,7 +708,7 @@ class Bot:
                            and (T["d"] < FIGHT_RANGE or t - self.hit_by.get(T["id"], -1e9) < 3))
             # shot by a mech we can see: stand and trade (running shows it our back, x1.5); hide once it lets up
             under_fire = bool(T and T["kind"] == "mech" and T["los"] and t - self.hit_by.get(T["id"], -1e9) < 3)
-            hide = self.cover_spot(pos, c, r, enemies, t) if self.hiding and not drop and not under_fire else None
+            hide = self.cover_spot(pos, c, r, enemies, t) if self.hiding and not drop and not under_fire and not finish else None
             farm = self.farm_goal(me, pos, c, r, enemies) if hpf >= 0.6 and not self.hiding else None  # targets() shoots them from 0.6
             calm = (not self.hiding and hpf >= 0.6 and not shot_at and not engaged
                     and not any(d2(m["pos"], pos) < ROOF_CALM for m in enemies))
