@@ -172,4 +172,14 @@ assert fb.weapons(me, muz, muz, T, fb.t)[1][1] is False
 T["m"]["hp"] = 1400
 assert fb.weapons(me, muz, muz, T, fb.t)[1][1] is True
 assert abs(fb.laser_need(LASER, dict(T, m={"hp": 200}), me) - 0.573) < 0.001 and fb.laser_need(LASER, None, me) == 0.75
+# giddy's LoseRule: 2 mechs near at 50% HP, or 3 at 75%, is losing (1 at 50%, or 2 at 75%, is not); at 30% against a
+# full-HP target it is, unless that target is under 25% with at most 2 near (finish it).
+T = fb.targets({"mechs": [mech(5, [60, 0, 0])], "crates": [], "beams": []}, me, muz, 1.0)
+two = [mech(5, [60, 0, 0]), mech(6, [-80, 0, 0])]
+assert fb.losing(two, T, 0.5, [0, 0, 0]) and not fb.losing(two[:1], T, 0.5, [0, 0, 0])
+assert fb.losing(two + [mech(7, [0, -100, 0])], T, 0.75, [0, 0, 0]) and not fb.losing(two, T, 0.75, [0, 0, 0])
+assert not fb.losing(two + [mech(7, [0, -170, 0])], T, 0.75, [0, 0, 0])  # the third is past LOSE_R
+assert fb.losing(two[:1], T, 0.3, [0, 0, 0])
+T["m"]["hp"] = 300
+assert not fb.losing(two, T, 0.3, [0, 0, 0])
 print("ok")

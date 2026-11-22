@@ -36,6 +36,7 @@ DROP_RANGE = 250.0   # m: farthest we go for a supply drop (3 cubes, full HP and
 ROAM_CELL = 40.0     # m: cells of the visited map; roaming heads for the one we left longest ago
 ROAM_REPICK = 25.0   # s: give up on a roam waypoint after this
 HIDE_HP, HEALED_HP = 0.25, 0.9  # HP fraction: hide below the first, go back out at the second
+LOSE_R, LOSE_S = 160.0, 1.5  # giddy's LoseRule: mechs listed this close count; the retreat holds this long after
 FIGHT_RANGE = 150.0  # m: a seen mech this close (or one shooting us) stops the roam: stand and strafe
 ROOF_Z = 3.0         # m above the terrain: an item this high is on a roof (a jump clears 2.75 m)
 ROOF_MAX = 45.0      # m: highest roof we jet up to for loot (100 energy climbs about 60 m)
@@ -163,6 +164,7 @@ class Bot:
         self.dbg = {}
         self.visited, self.roam, self.roam_t = {}, None, -1e9  # cell -> last t there; current waypoint
         self.hiding, self.cover, self.cover_t = False, None, -1e9
+        self.lose_t = -1e9               # last time losing() held
         self.climb = None                # roof loot: {p: item, t0}
         self.pred = Predictor(self.mech.get("gravity", 22), self.world.ground_at if self.world else None)
 
@@ -466,6 +468,16 @@ class Bot:
                 return best[1]
         return None
 
+    def losing(self, enemies, T, hpf, pos):
+        """giddy's squad LoseRule: outnumbered while hurt (2 mechs within LOSE_R below 55% HP, 3 below 80%), or below 35%
+        against a healthier target in sight; never while that target is under 25% and at most 2 are near (finish it)."""
+        n = sum(d2(m["pos"], pos) < LOSE_R for m in enemies)
+        lose = (n >= 2 and hpf < 0.55) or (n >= 3 and hpf < 0.8)
+        if T and T["kind"] == "mech" and T["los"]:
+            tf = T["m"].get("hp", 1400) / max(T["m"].get("max_hp", 1400), 1)
+            lose = (lose or (hpf < 0.35 and tf > hpf + 0.1)) and not (tf < 0.25 and hpf > 0.2 and n <= 2)
+        return lose
+
     # ----- movement -----
     def dodge(self, obs, me, pos):
         """A move vector away from an incoming shell, or None. (No laser dodge: a hitscan beam can't be sidestepped.)"""
@@ -667,6 +679,14 @@ class Bot:
             # regen needs 5 s without dealing damage too: shoot only whoever is on us; a charge is held
             fire = [bool(w and w["kind"] == "laser" and w.get("charge", 0) > 0) for w in me["weapons"]]
 
+        # Outnumbered and losing: break their line of sight (giddy), still shooting; not while finishing one, nor late.
+        if self.losing(enemies, T, hpf, pos):
+            self.lose_t = t
+        finishing = bool(T and T["kind"] == "mech" and T["los"] and T["d"] < 120
+                         and (T["m"].get("hp", 1400) < 200 or T["m"].get("hp", 1400) < me["hp"] * 0.5))
+        late = obs["zone"]["next_radius"] <= 70 or obs.get("alive", 16) <= 3
+        retreat = t - self.lose_t < LOSE_S and not finishing and not late
+
         # Movement goal.
         c, r = zone_at(obs["zone"], t + LOOKAHEAD_S)
         spot = self.free_edge_spot(pos, c, r)
@@ -694,6 +714,7 @@ class Bot:
             # shot by a mech we can see: stand and trade (running shows it our back, x1.5); hide once it lets up
             under_fire = bool(T and T["kind"] == "mech" and T["los"] and t - self.hit_by.get(T["id"], -1e9) < 3)
             hide = self.cover_spot(pos, c, r, enemies, t) if self.hiding and not drop and not under_fire else None
+            cover = self.cover_spot(pos, c, r, enemies, t) if retreat else None  # none within 40 m: fight on (cornered)
             farm = self.farm_goal(me, pos, c, r, enemies) if hpf >= 0.6 and not self.hiding else None  # targets() shoots them from 0.6
             calm = (not self.hiding and hpf >= 0.6 and not shot_at and not engaged
                     and not any(d2(m["pos"], pos) < ROOF_CALM for m in enemies))
@@ -703,7 +724,9 @@ class Bot:
                 rp = self.roof_target(me, pos, c, r)
                 if rp:
                     self.climb = dict(p=rp, t0=t)
-            if drop:
+            if cover:
+                goal, mode, arrive = cover, "cover", 1.5
+            elif drop:
                 goal, mode, arrive = drop["pos"], "drop", max(drop["radius"] - 3, 1.0)
             elif hide:
                 goal, mode, arrive = hide, "hide", 1.5
@@ -767,7 +790,7 @@ class Bot:
                 a = math.atan2(move[1], move[0]) + self.rng.choice((-1, 1)) * math.pi / 2
                 self.unstick_dir, self.unstick_until = [math.cos(a), math.sin(a)], t + 1.0
                 self.stuck_since, self.path = None, []
-        boost = climbing or mode in ("dodge shell", "zone") or (stuck and not fighting) or (
+        boost = climbing or mode in ("dodge shell", "zone", "cover") or (stuck and not fighting) or (
             gap > 40 and me["energy"] > 60 and not T and mode != "roof")  # save the energy for the jet
         if fighting:  # boost through the whole fight, walking just long enough to recharge (duel-tested; jets lost)
             self.burn = me["energy"] > 70 if not self.burn else me["energy"] > 25
